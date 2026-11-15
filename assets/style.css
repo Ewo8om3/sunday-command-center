@@ -156,3 +156,7 @@ code{background:#0e141c;padding:0 4px;border-radius:4px}
 [data-density=cozy] .view-rail .games{grid-template-columns:repeat(2,1fr)}
 [data-density=cozy] .chips.opp .chip .p{display:none}
 .hdr .clock{white-space:nowrap}
+.plat{font-size:.6em;font-weight:800;border-radius:.25em;padding:0 .3em;margin-right:.4em;letter-spacing:.05em}
+.plat.sleeper{background:#1d3b52;color:#7cc7ff}
+.plat.espn{background:#4a1416;color:#ff8a8a}
+.modal details{margin:6px 0}

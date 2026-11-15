@@ -5,7 +5,7 @@
   var qs = new URLSearchParams(location.search);
   var VIEW = qs.get("view") || "all";             // all | rail | strip
   var DEMO = qs.has("demo");
-  var settings = load(LS.settings, { display: "auto", username: "", userId: "", displayName: "", hidden: [], redzoneUrl: "", sound: false, zoom: 1, minDelta: 1.5, poll: 15 });
+  var settings = load(LS.settings, { display: "auto", espn: [], espnS2: "", espnSwid: "", proxyUrl: "http://localhost:8766", username: "", userId: "", displayName: "", hidden: [], redzoneUrl: "", sound: false, zoom: 1, minDelta: 1.5, poll: 15 });
   var dkData = load(LS.dk, { lineups: [], salaries: {}, files: [], importedAt: null });
   var feed = load(LS.feed, []);
   var prevInterest = DEMO ? null : load(LS.prev, null);
@@ -43,6 +43,41 @@
       .catch(function (e) { if (c) return c.v; throw e; });
   }
 
+  /* ESPN fantasy: public leagues load directly (ESPN allows CORS). Private leagues try your browser's own
+     ESPN login cookies, then the optional local proxy (proxy/espn_proxy.py) which adds espn_s2/SWID. */
+  var espnMode = {};
+  function espnFetch(path, key) {
+    var c = cache[path];
+    if (c && Date.now() - c.t < 20000) return Promise.resolve(c.v);
+    function get(url, opts) {
+      return fetch(url, opts).then(function (r) {
+        if (r.status === 401 || r.status === 403) { var e = new Error("private"); e.auth = true; throw e; }
+        if (!r.ok) throw new Error("ESPN " + r.status);
+        return r.json();
+      });
+    }
+    function viaProxy() {
+      var h = {};
+      if (settings.espnS2 && settings.espnSwid) { h["X-Espn-S2"] = settings.espnS2; h["X-Espn-Swid"] = settings.espnSwid; }
+      return get(settings.proxyUrl.replace(/\/$/, "") + "/espn" + path, { headers: h, credentials: "omit" })
+        .catch(function (e) {
+          if (e.auth) throw new Error(settings.espnS2 && settings.espnSwid ? "ESPN private league: the proxy is running but ESPN rejected your espn_s2/SWID (expired? re-copy them)"
+            : "ESPN private league: proxy is running; add your espn_s2 + SWID in Settings → ESPN (or proxy/config.json)");
+          throw new Error("ESPN private league: start proxy/start-proxy (see README) — " + e.message);
+        });
+    }
+    var mode = espnMode[key], url = SCC.ESPN_HOST + path, p;
+    if (mode === "proxy") p = viaProxy();
+    else if (mode === "cookie") p = get(url, { credentials: "include" });
+    else p = get(url, { credentials: "omit" }).then(function (v) { espnMode[key] = "direct"; return v; })
+      .catch(function (e) {
+        if (!e.auth) throw e;
+        return get(url, { credentials: "include" }).then(function (v) { espnMode[key] = "cookie"; return v; })
+          .catch(function () { return viaProxy().then(function (v) { espnMode[key] = "proxy"; return v; }); });
+      });
+    return p.then(function (v) { cache[path] = { t: Date.now(), v: v }; return v; }).catch(function (e) { if (c) return c.v; throw e; });
+  }
+
   function gather() {
     return getJSON("https://api.sleeper.app/v1/state/nfl", 600).then(function (st) {
       var season = qs.get("season") || st.league_season || st.season, week = qs.get("week") || st.display_week || st.week;
@@ -57,12 +92,17 @@
             .catch(function (e) { lastErr = l.name + ": " + e.message; return null; });
         }));
       }).then(function (L) { return { userId: settings.userId, leagues: L.filter(Boolean) }; });
+      var espnP = DEMO ? Promise.resolve([]) : Promise.all((settings.espn || []).map(function (cfg) {
+        return espnFetch(SCC.espnPath(cfg.season || season, cfg.leagueId, week), cfg.leagueId + ":" + cfg.season)
+          .then(function (d) { return { cfg: cfg, data: d }; })
+          .catch(function (e) { lastErr = (cfg.leagueName || "ESPN " + cfg.leagueId) + ": " + e.message; return null; });
+      })).then(function (a) { return a.filter(Boolean); });
       var sbP = getJSON(U.scoreboard, 10).then(function (sb) { return { sb: sb }; }).catch(function () {
         return getJSON(U.schedule, 60).then(function (sc) { return { schedule: sc }; });
       });
-      return Promise.all([sbP, getJSON(U.stats, 15), getJSON(U.projections, 1800), sleeperP])
+      return Promise.all([sbP, getJSON(U.stats, 15), getJSON(U.projections, 1800), sleeperP, espnP])
         .then(function (a) {
-          var raw = { season: season, week: week, scoreboard: a[0].sb || null, schedule: a[0].schedule, stats: a[1], projections: a[2], sleeper: a[3], dk: dkData };
+          var raw = { season: season, week: week, scoreboard: a[0].sb || null, schedule: a[0].schedule, stats: a[1], projections: a[2], sleeper: a[3], espn: a[4], dk: dkData };
           if (DEMO) Object.assign(raw, makeDemo(raw));
           return SCC.buildState(raw);
         });
@@ -107,6 +147,7 @@
   function tick() {
     if (busy) return;
     busy = true;
+    lastErr = "";
     gather().then(function (st) {
       var ev = SCC.diffEvents(prevInterest, st.interest, settings.minDelta);
       var now = Date.now();
@@ -120,7 +161,7 @@
       save(LS.feed, feed);
       prevInterest = st.interest;
       if (!DEMO) save(LS.prev, st.interest);
-      S = st; lastOk = now; lastErr = "";
+      S = st; lastOk = now;
       render();
     }).catch(function (e) { lastErr = e.message || String(e); render(); console.error(e); })
       .then(function () { busy = false; });
@@ -209,17 +250,18 @@
 
   function sleeperPanel() {
     if (!S.sleeper.length) {
-      return '<div class="panel"><h2>Sleeper</h2><div class="none" style="color:var(--dim)">' +
-        (settings.userId || DEMO ? "No in-season Sleeper matchups this week." : 'Add your Sleeper username in <button class="btn" data-act="settings">⚙ Settings</button>') + "</div></div>";
+      return '<div class="panel"><h2>Fantasy</h2><div class="none" style="color:var(--dim)">' +
+        (settings.userId || (settings.espn || []).length || DEMO ? "No fantasy matchups this week." : 'Add your Sleeper username or ESPN leagues in <button class="btn" data-act="settings">⚙ Settings</button>') + "</div></div>";
     }
     var sorted = S.sleeper.slice().sort(function (a, b) { return Math.abs((a.winProb || 0.5) - 0.5) - Math.abs((b.winProb || 0.5) - 0.5); });
     var rec = { w: 0, l: 0 };
     S.sleeper.forEach(function (m) { if (m.opp) { if (m.me.live >= m.opp.live) rec.w++; else rec.l++; } });
-    return '<div class="panel scroll"><h2>Sleeper matchups <span>projected ' + rec.w + "-" + rec.l + " · closest first</span></h2><div class='mus'>" + sorted.map(function (m) {
+    return '<div class="panel scroll"><h2>Fantasy matchups <span>projected ' + rec.w + "-" + rec.l + " · closest first</span></h2><div class='mus'>" + sorted.map(function (m) {
       var me = m.me, op = m.opp || { name: "Bye", pts: 0, live: 0, starters: [], yet: 0, playing: 0, record: "" };
       var wp = m.winProb == null ? null : Math.round(m.winProb * 100);
       var share = me.live + op.live > 0 ? 100 * me.live / (me.live + op.live) : 50;
-      return '<div class="mu"><div class="top"><span class="lg">' + esc(m.league) + "</span>" +
+      return '<div class="mu"><div class="top"><span class="plat ' + m.platform + '">' + (m.platform === "espn" ? "ESPN" : "SLPR") + '</span><span class="lg">' + esc(m.league) + "</span>" +
+        (m.me.espnProj != null ? '<span class="wp" style="color:var(--dim)" title="ESPN live projection">ESPN proj ' + f1(m.me.espnProj) + "</span>" : "") +
         (wp == null ? "" : '<span class="wp" style="color:' + (wp >= 50 ? "var(--good)" : "var(--bad)") + '">' + wp + "% win</span>") + "</div>" +
         '<div class="score"><span class="nm">' + esc(me.name) + ' <small style="color:var(--dim)">' + esc(me.record) + '</small></span><span class="pts num ' + (me.pts >= op.pts ? "win" : "lose") + '">' + f2(me.pts) +
         '</span><span class="pts num">' + f2(op.pts) + '</span><span class="nm r">' + esc(op.name) + "</span></div>" +
@@ -325,6 +367,14 @@
       "<h3>1 · Sleeper</h3>" +
       '<div class="rowf"><input id="su" placeholder="Sleeper username" value="' + esc(settings.username) + '"><button class="btn" data-act="finduser">Find me</button></div>' +
       '<div id="sumsg" class="hint">' + (settings.userId ? "Connected as <b>" + esc(settings.displayName) + "</b>" : "") + "</div><div id=\"leaguelist\"></div>" +
+      "<h3>1b · ESPN leagues</h3>" +
+      '<div id="espnlist"></div>' +
+      '<div class="rowf"><input id="eid" placeholder="ESPN league ID (from the league URL: leagueId=…)" style="width:22em"><input id="eseason" type="number" style="width:6em" value="' + esc(currentSeason()) + '"><button class="btn" data-act="espnload">Load teams</button></div>' +
+      '<div class="rowf" id="eteams"></div>' +
+      '<details><summary class="hint">Private ESPN league? (espn_s2 / SWID)</summary>' +
+      '<p class="hint">Public leagues just work. For private leagues the page first tries your browser\'s own ESPN login. If that\'s blocked, run the tiny local proxy (<code>proxy/start-proxy.bat</code> or <code>.sh</code>) and paste your cookies here (see README). They\'re kept in this browser and only ever sent to the proxy on <code>localhost</code>.</p>' +
+      '<div class="rowf"><input id="es2" type="password" placeholder="espn_s2" value="' + esc(settings.espnS2) + '" style="width:18em"><input id="eswid" type="password" placeholder="SWID {…}" value="' + esc(settings.espnSwid) + '" style="width:16em"></div>' +
+      '<div class="rowf"><label>Proxy <input id="eproxy" value="' + esc(settings.proxyUrl) + '" style="width:14em"></label><button class="btn" data-act="proxytest">Test proxy</button><span id="proxymsg" class="hint"></span></div></details>' +
       "<h3>2 · DraftKings lineups</h3>" +
       '<p class="hint">Drop or pick any of: your <b>entries export</b> (DK → My Contests → Upcoming → Export to CSV, best: includes contests &amp; teams), the <b>upload CSV</b> you edit for DK bulk upload, and optionally <b>DKSalaries.csv</b> from the lobby. Or paste lineups, one per line: <code>Name (ID), Name (ID), …</code></p>' +
       '<div class="drop" id="drop">Drop CSV files here or <label class="btn">browse<input type="file" id="files" accept=".csv,text/csv,text/plain" multiple hidden></label></div>' +
@@ -349,6 +399,57 @@
     drop.addEventListener("drop", function (e) { e.preventDefault(); drop.classList.remove("over"); importFiles(e.dataTransfer.files); });
     modal.querySelector("#files").addEventListener("change", function (e) { importFiles(e.target.files); });
     if (settings.userId) listLeagues();
+    renderEspnList();
+  }
+  var seasonGuess = String(new Date().getMonth() < 2 ? new Date().getFullYear() - 1 : new Date().getFullYear());
+  function currentSeason() { return (S && S.season) || seasonGuess; }
+  function renderEspnList() {
+    var box = modal && modal.querySelector("#espnlist");
+    if (!box) return;
+    box.innerHTML = (settings.espn || []).map(function (c, i) {
+      return '<div class="lgopt">ESPN · <b>' + esc(c.leagueName || c.leagueId) + "</b> (" + esc(c.season) + ") · " + esc(c.teamName || "team " + c.teamId) +
+        ' <button class="btn" data-act="espnremove" data-i="' + i + '">remove</button></div>';
+    }).join("") || '<span class="hint">No ESPN leagues added.</span>';
+  }
+  var espnPending = null;
+  function espnLoad() {
+    var id = modal.querySelector("#eid").value.replace(/.*leagueId=/, "").replace(/\D.*$/, ""), season = modal.querySelector("#eseason").value || currentSeason();
+    var out = modal.querySelector("#eteams");
+    if (!id) { out.innerHTML = '<span class="err">Enter a league ID.</span>'; return; }
+    readEspnCreds();
+    out.innerHTML = '<span class="hint">Loading…</span>';
+    espnFetch(SCC.espnPath(season, id, null).replace(/&view=mBoxscore|&view=mMatchupScore|&view=mRoster/g, ""), id + ":" + season).then(function (d) {
+      var teams = SCC.espnTeams(d);
+      espnPending = { leagueId: id, season: String(season), leagueName: (d.settings || {}).name || ("ESPN " + id) };
+      out.innerHTML = "<b>" + esc(espnPending.leagueName) + '</b> <select id="eteam">' + teams.map(function (t) {
+        return '<option value="' + t.id + '">' + esc(t.name) + (t.owner ? " — " + esc(t.owner) : "") + "</option>";
+      }).join("") + '</select> <button class="btn" data-act="espnadd">Add — this is my team</button>' +
+        (espnMode[id + ":" + season] && espnMode[id + ":" + season] !== "direct" ? ' <span class="hint">(private, via ' + espnMode[id + ":" + season] + ")</span>" : "");
+    }).catch(function (e) { out.innerHTML = '<span class="err">' + esc(e.message) + "</span>"; });
+  }
+  function espnAdd() {
+    var sel = modal.querySelector("#eteam");
+    if (!espnPending || !sel) return;
+    var c = Object.assign({}, espnPending, { teamId: +sel.value, teamName: sel.options[sel.selectedIndex].text.split(" — ")[0] });
+    settings.espn = (settings.espn || []).filter(function (x) { return !(x.leagueId === c.leagueId && x.season === c.season); }).concat([c]);
+    save(LS.settings, settings);
+    modal.querySelector("#eteams").innerHTML = '<span class="hint">Added ' + esc(c.leagueName) + ".</span>";
+    renderEspnList(); cache = {}; tick();
+  }
+  function readEspnCreds() {
+    if (!modal) return;
+    settings.espnS2 = modal.querySelector("#es2").value.trim();
+    settings.espnSwid = modal.querySelector("#eswid").value.trim();
+    settings.proxyUrl = modal.querySelector("#eproxy").value.trim() || "http://localhost:8766";
+    save(LS.settings, settings);
+  }
+  function proxyTest() {
+    readEspnCreds();
+    var msg = modal.querySelector("#proxymsg");
+    msg.textContent = "checking…";
+    fetch(settings.proxyUrl.replace(/\/$/, "") + "/health").then(function (r) { return r.json(); }).then(function (h) {
+      msg.innerHTML = h.ok ? '<span style="color:var(--good)">proxy OK</span>' + (h.cookiesInConfig ? " · cookies in config.json" : settings.espnS2 ? " · using cookies from this page" : ' · <span class="err">no cookies yet</span>') : "unexpected reply";
+    }).catch(function () { msg.innerHTML = '<span class="err">no proxy at ' + esc(settings.proxyUrl) + "</span>"; });
   }
   function dkSummary() {
     if (!dkData.lineups.length) return "No DK lineups imported yet.";
@@ -435,6 +536,10 @@
       else if (act === "close") { modal.remove(); modal = null; }
       else if (act === "help") document.querySelector(".help").classList.toggle("on");
       else if (act === "finduser") findUser();
+      else if (act === "espnload") espnLoad();
+      else if (act === "espnadd") espnAdd();
+      else if (act === "espnremove") { settings.espn.splice(+a.getAttribute("data-i"), 1); save(LS.settings, settings); renderEspnList(); tick(); }
+      else if (act === "proxytest") proxyTest();
       else if (act === "clearfeed") { feed = []; save(LS.feed, feed); render(); }
       else if (act === "importpaste") { var t = modal.querySelector("#paste").value; if (t.trim()) { var r = importText(t, "pasted", modal.querySelector("#replace").checked); finishImport(["pasted: " + r.lineups.length + " lineups, " + Object.keys(r.salaries).length + " salaries"]); } }
       else if (act === "cleardk") { dkData = { lineups: [], salaries: {}, files: [], importedAt: null }; finishImport(["cleared"]); }
@@ -450,6 +555,7 @@
     settings.redzoneUrl = modal.querySelector("#rz").value.trim();
     settings.zoom = parseFloat(modal.querySelector("#zoom").value) || 1;
     settings.display = modal.querySelector("#display").value || "auto";
+    readEspnCreds();
     settings.poll = Math.max(10, parseInt(modal.querySelector("#poll").value, 10) || 15);
     settings.sound = modal.querySelector("#sound").checked;
     save(LS.settings, settings);
@@ -479,6 +585,6 @@
     "<p style='margin-top:1em;color:var(--dim)'>DK points are calculated from Sleeper's live stats with DraftKings Classic scoring, so they can lag or differ slightly from DK's official numbers. Contest ranks and payouts live in DK My Contests.</p>";
   document.body.appendChild(help);
 
-  if (!DEMO && !settings.userId && !dkData.lineups.length) { render(); openSettings(); }
+  if (!DEMO && !settings.userId && !(settings.espn || []).length && !dkData.lineups.length) { render(); openSettings(); }
   start();
 })();

@@ -255,6 +255,87 @@
     return out;
   }
 
+
+  /* ------------------------------------------------------------ ESPN fantasy */
+  var ESPN_HOST = "https://lm-api-reads.fantasy.espn.com";
+  var ESPN_TEAM = { 1: "ATL", 2: "BUF", 3: "CHI", 4: "CIN", 5: "CLE", 6: "DAL", 7: "DEN", 8: "DET", 9: "GB", 10: "TEN", 11: "IND",
+    12: "KC", 13: "LV", 14: "LAR", 15: "MIA", 16: "MIN", 17: "NE", 18: "NO", 19: "NYG", 20: "NYJ", 21: "PHI", 22: "ARI", 23: "PIT",
+    24: "LAC", 25: "SF", 26: "SEA", 27: "TB", 28: "WAS", 29: "CAR", 30: "JAX", 33: "BAL", 34: "HOU" };
+  var ESPN_POS = { 1: "QB", 2: "RB", 3: "WR", 4: "TE", 5: "K", 16: "DEF", 9: "DL", 10: "LB", 11: "DL", 12: "DB", 13: "DB", 14: "DB", 15: "DL" };
+  var ESPN_BENCH = { 20: 1, 21: 1, 24: 1 };   // bench, IR, (unused)
+  var ESPN_SLOT_ORDER = { 0: 0, 7: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 23: 7, 16: 8, 17: 9 };
+
+  function slotRank(id) { return id in ESPN_SLOT_ORDER ? ESPN_SLOT_ORDER[id] : 50; }
+  function espnPath(season, leagueId, week) {
+    return "/apis/v3/games/ffl/seasons/" + season + "/segments/0/leagues/" + encodeURIComponent(leagueId) +
+      "?view=mMatchupScore&view=mTeam&view=mRoster&view=mBoxscore&view=mSettings" + (week ? "&scoringPeriodId=" + week : "");
+  }
+  function espnTeamName(t) {
+    return t.name || ((t.location || "") + " " + (t.nickname || "")).trim() || t.abbrev || ("Team " + t.id);
+  }
+  /* list of {id, name, owner} for the team picker */
+  function espnTeams(data) {
+    var mem = {};
+    (data.members || []).forEach(function (m) { mem[m.id] = m.displayName || ((m.firstName || "") + " " + (m.lastName || "")).trim(); });
+    return (data.teams || []).map(function (t) {
+      return { id: t.id, name: espnTeamName(t), owner: (t.owners || []).map(function (o) { return mem[o]; }).filter(Boolean).join(", ") };
+    });
+  }
+
+  /* raw = [{cfg:{leagueId, season, teamId}, data:<league json>}] -> same card shape as buildSleeper */
+  function buildESPN(raw, m, teamGame) {
+    var idx = {};
+    Object.keys(m.info).forEach(function (pid) { var i = m.info[pid]; idx[norm(i.name) + "|" + i.team] = pid; if (i.pos === "DEF") idx["def|" + pid] = pid; });
+    var out = [];
+    (raw || []).forEach(function (L) {
+      var d = L.data, cfg = L.cfg;
+      if (!d || !d.teams) return;
+      var week = d.scoringPeriodId, period = (d.status || {}).currentMatchupPeriod;
+      var mu = (d.schedule || []).filter(function (x) {
+        return x.matchupPeriodId === period && ((x.home || {}).teamId === +cfg.teamId || (x.away || {}).teamId === +cfg.teamId);
+      })[0];
+      if (!mu) return;
+      var mineSide = mu.home && mu.home.teamId === +cfg.teamId ? "home" : "away", oppSide = mineSide === "home" ? "away" : "home";
+      var teams = {};
+      d.teams.forEach(function (t) { teams[t.id] = t; });
+      function side(x) {
+        if (!x) return null;
+        var t = teams[x.teamId] || {}, rec = (t.record || {}).overall || {};
+        var roster = x.rosterForCurrentScoringPeriod || x.rosterForMatchupPeriod || { entries: [] };
+        var rows = (roster.entries || []).filter(function (e) { return !ESPN_BENCH[e.lineupSlotId]; })
+          .sort(function (a, b) { return slotRank(a.lineupSlotId) - slotRank(b.lineupSlotId); })
+          .map(function (e) {
+            var pe = e.playerPoolEntry || {}, pl = pe.player || {};
+            var team = ESPN_TEAM[pl.proTeamId] || null, pos = ESPN_POS[pl.defaultPositionId] || "?";
+            var stats = pl.stats || [], act = 0, proj = 0;
+            stats.forEach(function (st) {
+              if (st.scoringPeriodId !== week) return;
+              if (st.statSourceId === 0) act = num(st.appliedTotal); else if (st.statSourceId === 1) proj = num(st.appliedTotal);
+            });
+            if (pe.appliedStatTotal != null) act = num(pe.appliedStatTotal);
+            var sid = pos === "DEF" ? (idx["def|" + team] || team) : (idx[norm(pl.fullName) + "|" + team] || ("espn:" + pl.id));
+            var g = teamGame[team], remain = g ? g.remain : 0;
+            var name = pos === "DEF" ? ((m.info[team] || {}).name || pl.fullName) : pl.fullName;
+            return { id: sid, name: name, pos: pos, team: team, pts: round2(act), proj: round1(proj), live: round1(act + proj * remain),
+              remainProj: proj * remain, status: g ? g.state : "bye", rz: !!(g && g.rz), poss: !!(g && g.poss === team),
+              inj: pl.injuryStatus && pl.injuryStatus !== "ACTIVE" ? pl.injuryStatus : null, game: g ? g.id : null };
+          });
+        var pts = num(x.totalPointsLive != null ? x.totalPointsLive : x.totalPoints);
+        var remainProj = rows.reduce(function (a, r) { return a + r.remainProj; }, 0);
+        return { name: espnTeamName(t), pts: round2(pts), live: round1(pts + remainProj), remainProj: remainProj,
+          espnProj: x.totalProjectedPointsLive != null ? round1(num(x.totalProjectedPointsLive)) : null,
+          proj: round1(rows.reduce(function (a, r) { return a + r.proj; }, 0)), starters: rows, empty: 0,
+          yet: rows.filter(function (r) { return r.status === "pre"; }).length, playing: rows.filter(function (r) { return r.status === "in"; }).length,
+          record: (rec.wins || 0) + "-" + (rec.losses || 0) + (rec.ties ? "-" + rec.ties : ""), espnWin: x.winProbability };
+      }
+      var me = side(mu[mineSide]), opp = side(mu[oppSide]);
+      var wp = opp ? (me.espnWin != null && isFinite(me.espnWin) ? num(me.espnWin) : winProb(me, opp)) : null;
+      out.push({ platform: "espn", league: ((d.settings || {}).name || ("ESPN " + cfg.leagueId)).trim(), leagueId: String(cfg.leagueId),
+        me: me, opp: opp, winProb: wp, scoring: "league" });
+    });
+    return out;
+  }
+
   /* dk = {lineups:[...], salaries:{...}} from parseDK (possibly merged across files) */
   function buildDK(dk, m, teamGame) {
     dk = dk || { lineups: [], salaries: {} };
@@ -340,7 +421,8 @@
   function buildState(raw) {
     var sb = raw.scoreboard ? parseScoreboard(raw.scoreboard) : scheduleToScoreboard(raw.schedule, raw.week, raw.stats);
     var m = statMaps(raw.stats, raw.projections);
-    var sleeper = raw.sleeper ? buildSleeper(raw.sleeper, m, sb.teamGame) : [];
+    var sleeper = (raw.sleeper ? buildSleeper(raw.sleeper, m, sb.teamGame) : []).map(function (x) { x.platform = "sleeper"; return x; })
+      .concat(raw.espn ? buildESPN(raw.espn, m, sb.teamGame) : []);
     var dk = buildDK(raw.dk, m, sb.teamGame);
     var interest = buildInterest(sleeper, dk, m, sb.teamGame, sb.games);
     return { week: raw.week, season: raw.season, scoreSource: raw.scoreboard ? "espn" : "sleeper-schedule", games: sb.games, sleeper: sleeper, dk: dk, interest: interest };
@@ -363,7 +445,7 @@
     return ev;
   }
 
-  return { urls: urls, norm: norm, dkPoints: dkPoints, tdCount: tdCount, parseCSV: parseCSV, parseDK: parseDK,
+  return { ESPN_HOST: ESPN_HOST, espnPath: espnPath, espnTeams: espnTeams, buildESPN: buildESPN, urls: urls, norm: norm, dkPoints: dkPoints, tdCount: tdCount, parseCSV: parseCSV, parseDK: parseDK,
     parseScoreboard: parseScoreboard, scheduleToScoreboard: scheduleToScoreboard, statMaps: statMaps, buildSleeper: buildSleeper, buildDK: buildDK,
     buildState: buildState, diffEvents: diffEvents, winProb: winProb, leaguePtsKey: leaguePtsKey, NICK: NICK };
 });

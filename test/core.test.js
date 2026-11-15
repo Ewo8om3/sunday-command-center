@@ -108,3 +108,28 @@ test("schedule fallback builds games from Sleeper data", () => {
   assert.strictEqual(sb.games[0].hs, 17);
   assert.strictEqual(sb.teamGame.KC.state, "in");
 });
+
+test("ESPN league -> normalized matchup card", () => {
+  const pe = (id, name, team, pos, act, proj) => ({ playerPoolEntry: { appliedStatTotal: act, player: { id, fullName: name, proTeamId: team, defaultPositionId: pos,
+    stats: [{ statSourceId: 1, scoringPeriodId: 10, appliedTotal: proj }] } } });
+  const data = { scoringPeriodId: 10, status: { currentMatchupPeriod: 10 }, settings: { name: "ESPN Test" },
+    members: [{ id: "{A}", displayName: "alice" }, { id: "{B}", displayName: "bob" }],
+    teams: [{ id: 1, name: "Alpha", owners: ["{A}"], record: { overall: { wins: 6, losses: 3 } } }, { id: 2, location: "Beta", nickname: "Bots", owners: ["{B}"], record: { overall: {} } }],
+    schedule: [{ matchupPeriodId: 10, home: { teamId: 2, totalPointsLive: 9, rosterForCurrentScoringPeriod: { entries: [Object.assign({ lineupSlotId: 0 }, pe(9, "Some QB", 6, 1, 9, 18))] } },
+      away: { teamId: 1, totalPointsLive: 22.4, winProbability: 0.7, rosterForCurrentScoringPeriod: { entries: [
+        Object.assign({ lineupSlotId: 20 }, pe(8, "Bench Guy", 12, 3, 30, 10)),
+        Object.assign({ lineupSlotId: 2 }, pe(7, "Rob Runner Jr.", 1, 2, 20.4, 15)),
+        Object.assign({ lineupSlotId: 0 }, pe(6, "Pat Passer", 12, 1, 22.4, 20))] } } }] };
+  assert.deepStrictEqual(SCC.espnTeams(data).map(t => t.name + "/" + t.owner), ["Alpha/alice", "Beta Bots/bob"]);
+  const s = SCC.buildState({ week: 10, season: "2026", scoreboard, stats, projections, espn: [{ cfg: { leagueId: "1", teamId: 1 }, data }] });
+  const m = s.sleeper[0];
+  assert.strictEqual(m.platform, "espn");
+  assert.strictEqual(m.me.name, "Alpha");
+  assert.strictEqual(m.me.record, "6-3");
+  assert.deepStrictEqual(m.me.starters.map(r => r.pos), ["QB", "RB"]);   // bench skipped, slot order
+  assert.strictEqual(m.me.starters[0].id, "100");                          // mapped to the Sleeper id
+  assert.strictEqual(m.me.starters[1].team, "ATL");
+  assert.strictEqual(m.winProb, 0.7);
+  assert.strictEqual(m.opp.name, "Beta Bots");
+  assert.deepStrictEqual(s.interest["100"].mine, ["ESPN Test"]);
+});
