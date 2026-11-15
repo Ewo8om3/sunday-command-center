@@ -26,12 +26,15 @@ and troubleshooting.
   Sleeper projections follow each league's PPR / half / standard setting. ESPN cards use ESPN's own league
   scoring, live projection and win probability. Closest matchups are listed first.
 - **DraftKings lineups**: import your entries CSV, upload CSV or pasted lineups. Live **DK Classic scoring**
-  is calculated from Sleeper's live stats (300/100/100 bonuses, DST points-allowed tiers), with best lineup,
-  ranks across your entries, players still to play and an exposure table.
+  is calculated from Sleeper's live stats (300/100/100 bonuses, defensive and special-teams fumble recoveries,
+  DST points-allowed tiers once the DST's game has kicked off), with best lineup, ranks across your entries,
+  players still to play and an exposure table. Slots it can't read are flagged, never silently dropped.
 - **Scoring feed + toasts**: every scoring change on a player you care about, tagged by whether it helps
   or hurts you, with a big banner for touchdowns. Sound is optional.
 - **Layouts**: `all` (one window), `rail` (tall right column) and `strip` (bottom bar) views, plus
   **Display size** presets (Auto / 1080p / 1440p / 4K) that tune fonts, density and the window split.
+- **Honest status dot**: green only when every feed refreshed recently. If a feed fails, the dot turns amber
+  (or red when nothing is getting through) and shows the real age of the data and which feed is failing.
 - **Private by design**: your Sleeper username, ESPN leagues and lineups stay in your browser's `localStorage`.
   Nothing gets uploaded, and there are no API keys.
 
@@ -51,7 +54,10 @@ First run opens **Settings**:
    **ESPN**: paste a league ID (or the whole league URL), check the season → *Load teams* → pick your team →
    *Add*. Repeat for as many leagues as you like. Private league? See below.
 2. **DraftKings**: drop in one or more CSVs:
-   - *Best:* DK → My Contests → Upcoming → **Export to CSV**. This includes contest names, fees and a player/team table.
+   - *Best:* your entries file, **`DKEntries.csv`**. On the DraftKings website: **Lineups → Edit Entries** → pick
+     the slate → **Download** (DK sometimes renames these menus; it's the bulk "edit entries" download, not the
+     lobby's player list). It includes contest names, fees and a player/team table. Players tagged
+     `(LOCKED)` after kickoff are read normally, and any slot that can't be read is listed as a warning.
    - Your bulk **upload CSV** (`QB,RB,RB,WR,WR,WR,TE,FLEX,DST` with `Name (ID)` cells).
    - Optional: **DKSalaries.csv** from the contest lobby (adds teams/salaries for exact matching).
    - Or paste lineups, one per line: `Name (ID), Name (ID), …`
@@ -81,9 +87,17 @@ click Allow.
 2. Open DevTools (`F12`, or `Cmd`+`Opt`+`I` on Mac) → **Application** tab (Firefox: **Storage**) → **Cookies** →
    `https://fantasy.espn.com`.
 3. Copy the **Value** of `espn_s2` (a long string) and `SWID` (looks like `{XXXXXXXX-XXXX-…}`, braces included).
-4. Paste both into Settings → ESPN → *Private ESPN league*. They're saved in this browser's `localStorage` and
-   are only ever sent to the proxy on `localhost`. Or put them in `proxy/config.json` instead (copy
-   `config.example.json`; the real file is git-ignored).
+4. **Recommended:** put them in `proxy/config.json` (copy `config.example.json`; the real file is git-ignored)
+   and leave the boxes in the page empty.
+   Or paste both into Settings → ESPN → *Private ESPN league*. Then they're saved in this browser's
+   `localStorage` for the page's address and sent only to a proxy at `localhost` / `127.0.0.1` (the page
+   refuses any other Proxy address). On the hosted copy, that storage is shared by every project page under
+   `ewo8om3.github.io`, which is why `config.json` (or running the page locally) is the safer place for them.
+
+The proxy only answers pages from `https://ewo8om3.github.io`, `http://localhost:*` and `http://127.0.0.1:*`
+and refuses every other website. Hosting your own fork? Add its address with `SCC_ALLOWED_ORIGINS` or
+`"allowed_origins"` in `config.json` (see [`proxy/README.md`](proxy/README.md)). Opening `index.html` straight
+from disk (`file://`) needs an opt-in there too; `python3 -m http.server` is the simpler route.
 
 Treat these cookies like a password: they give read access to your ESPN account's leagues. Never commit or
 share them. They expire after a while, so re-copy them if private leagues stop loading.
@@ -91,16 +105,20 @@ share them. They expire after a while, so re-copy them if private leagues stop l
 ## Put it next to RedZone
 
 See **[SETUP.md](SETUP.md)** for step-by-step layouts on any setup, with exact zone sizes, FancyZones / Snap /
-Rectangle / macOS tiling steps, and how to get each RedZone source into its own window. The 4K default looks like this:
+Rectangle / macOS tiling steps, and how to get each RedZone source into its own window. The 4K default looks like
+this (a real 3840×2160 render with the 4K preset and demo data; the RedZone and DK boxes are placeholders):
 
-![4K layout](docs/layout-4k.png)
+![4K layout: RedZone 2560×1440 top left, rail 1280×2160 on the right, strip 1706×720 and DK window along the bottom](docs/layout-4k.png)
 
 There's also a built-in **Open layout windows** button in Settings. It pops out RedZone, rail and strip
 windows sized for your display preset (allow pop-ups for the page).
 
 ## Data sources
 
-All of these are public, keyless and CORS-enabled, so the page calls them straight from your browser:
+All of these are keyless and CORS-enabled, so the page calls them straight from your browser. **Only Sleeper's
+`api.sleeper.app/v1` API is officially documented.** Sleeper's stats/projections/schedule feeds and both ESPN APIs
+are undocumented: they can change, rate-limit or stop working at any time, and this dashboard would break with
+them. Use them lightly and respect each service's terms.
 
 | What | Source |
 |---|---|
@@ -109,7 +127,9 @@ All of these are public, keyless and CORS-enabled, so the page calls them straig
 | ESPN fantasy leagues, matchups, rosters, live points | `lm-api-reads.fantasy.espn.com/apis/v3/games/ffl` (CORS-enabled; private leagues via the optional local proxy) |
 | Scores, clock, possession, red zone | ESPN's public scoreboard (`site.api.espn.com`). If it's unreachable, falls back to Sleeper's schedule (no clock / red zone). |
 
-Refreshes every 15 s by default. These are unofficial endpoints, so they may change or rate-limit without notice.
+Refresh rate: every 15 s (your setting) while a game is live or about to kick off, every minute on game days
+before the first kickoff, every 5 minutes when nothing is on. It backs off after errors, pauses in hidden tabs,
+and gives up on any request after 12 s.
 
 ## Limitations
 
@@ -120,7 +140,12 @@ Refreshes every 15 s by default. These are unofficial endpoints, so they may cha
   DK's My Contests, which needs your login. That's why there's a link and an optional DK window in the layout.
 - ESPN: tested against public leagues. The private-league proxy path is tested end-to-end up to ESPN's auth
   check, but not yet with real cookies. IDP and custom ESPN slots show with generic labels.
-- Classic NFL contests only (no Showdown/Captain yet). IDP-only Sleeper players show without names.
+- Built for Classic NFL contests. Showdown files import with the 1.5× captain applied, but kickers score 0.
+  IDP-only Sleeper players show without names.
+- Regular season first: the postseason follows Sleeper's `season_type` but is untested and marked
+  *postseason (experimental)*.
+- The `(LOCKED)` tag DraftKings adds to started players is handled from community reports; it hasn't been
+  checked against a real post-lock DraftKings file yet.
 - Win % is a rough normal-approximation from live projections, not a model.
 
 ## Development

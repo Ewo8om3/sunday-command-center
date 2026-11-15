@@ -50,7 +50,9 @@ Open <https://ewo8om3.github.io/sunday-command-center/>. Bookmark it, or install
 
 1. On the GitHub repo page, click **Code → Download ZIP**.
 2. Unzip it anywhere, e.g. `Documents\sunday-command-center`.
-3. Double-click `index.html`. It opens in your default browser as a `file://` page.
+3. Double-click `index.html`. It opens in your default browser as a `file://` page. (For private ESPN leagues
+   through the proxy, serve the folder as below instead; the proxy doesn't answer `file://` pages unless you
+   opt in, see §1.D.)
 
 Settings are saved per browser *and* per address, so the zip copy and the GitHub Pages copy have separate
 settings.
@@ -99,6 +101,14 @@ It's one Python file (`proxy/espn_proxy.py`) with no dependencies. It runs only 
 **Check it:** Settings → ESPN → *Private ESPN league* → **Test proxy** should say *proxy OK*. You can also open
 <http://localhost:8766/health> in your browser.
 
+**Who it answers:** only pages served from `https://ewo8om3.github.io`, `http://localhost:<any port>` and
+`http://127.0.0.1:<any port>`. Any other website open in your browser gets `403`, so it can't use your cookies.
+- Your own fork on GitHub Pages: start it with `SCC_ALLOWED_ORIGINS=https://yourname.github.io` (Windows
+  PowerShell: `$env:SCC_ALLOWED_ORIGINS="https://yourname.github.io"; py -3 espn_proxy.py`), or add
+  `"allowed_origins": ["https://yourname.github.io"]` to `proxy/config.json`.
+- `index.html` opened straight from disk (`file://`): set `SCC_ALLOW_FILE=1` or `"allow_file_origin": true` in
+  `config.json`. Serving the folder with `python3 -m http.server 8000` is safer and needs no opt-in.
+
 Stop it by closing the window or pressing `Ctrl+C`. Cookie setup is in [§7](#7-connecting-leagues).
 
 ---
@@ -109,7 +119,7 @@ Stop it by closing the window or pressing `Ctrl+C`. Cookie setup is in [§7](#7-
 |---|---|---|---|
 | **all** | `index.html` or `?view=all` | everything: radar, games, feed, fantasy, DK | a full monitor or a big zone |
 | **rail** | `?view=rail` | header, RedZone radar, games, fantasy matchups, scoring feed | tall and narrow (portrait-ish) |
-| **strip** | `?view=strip` | DraftKings lineups + exposure | wide and short |
+| **strip** | `?view=strip` | DraftKings lineups + exposure, with its own status dot and ⚙ button | wide and short |
 
 Add `&demo=1` to any of them for fake data. You can open the same view in several windows, and they all share
 the same settings.
@@ -164,7 +174,9 @@ No DK window? Make the strip 2560 × 720 (66.67% × 33.33%). Display preset: **4
 | Strip | 0, 1008 | 1195 × 432 | 46.67% × 30% |
 | DK My Contests (optional) | 1195, 1008 | 597 × 432 | 23.33% × 30% |
 
-Display preset: **1440p**. If the strip text is too small, skip the DK window and give the strip 70% × 30%.
+Display preset: **1440p**. In a strip this short, the DK panel shows one line per lineup (rank, points,
+projection, players) instead of side-by-side cards, so the text stays readable (about 16 px). Want the full cards?
+Skip the DK window and give the strip 70% × 30%.
 
 ### 3.3 Single 1080p monitor (1920×1080)
 
@@ -174,7 +186,9 @@ Display preset: **1440p**. If the strip text is too small, skip the DK window an
 | Rail | 1440, 0 | 480 × 1080 | 25% × 100% |
 | Strip | 0, 810 | 1440 × 270 | 75% × 25% |
 
-Display preset: **1080p** (compact). At 1080p, skip the separate DK window and check DK on your phone.
+Display preset: **1080p** (compact). The 270-px-tall strip shows one line per lineup (rank, points, projection,
+players; about 17 px text) rather than side-by-side cards, which would be too small to read here. At 1080p, skip
+the separate DK window and check DK on your phone.
 Alternative: RedZone **fullscreen** on the TV or monitor, with the dashboard on a second device (see 3.7/3.8).
 
 ### 3.4 Ultrawide 21:9 (3440×1440 or 2560×1080)
@@ -457,13 +471,15 @@ If **Load teams** says the league is private, the dashboard needs your two ESPN 
    `{ABCDEF12-3456-...}`, braces included).
 5. Click **Load teams** again → pick your team → **Add**.
 
-Alternative: copy `proxy/config.example.json` to `proxy/config.json` and put the values there. Then the page
-doesn't need them.
+**Safer alternative (recommended):** copy `proxy/config.example.json` to `proxy/config.json` and put the values
+there, and leave the boxes in the page empty. Then the cookies never sit in the browser at all.
 
 > **Security note:** `espn_s2` and `SWID` act like a logged-in session for **your ESPN account**. Anyone who has
 > them can read your leagues, and possibly do more, as you. Never post them, screenshot them, commit them or share
-> them with your buddies. Each person uses their own. In the dashboard they're stored only in your browser's
-> `localStorage` and are only sent to the proxy on `localhost`. `proxy/config.json` is git-ignored. To revoke them,
+> them with your buddies. Each person uses their own. If you paste them into the page, they're stored in your
+> browser's `localStorage` for that page's address and sent only to a proxy at `localhost` / `127.0.0.1` (the page
+> refuses any other Proxy address). On the hosted GitHub Pages copy that storage is shared by every project page
+> under the same `github.io` account, so `proxy/config.json` is the safer place. It's git-ignored. To revoke them,
 > sign out of ESPN on all devices (or change your password), which invalidates the cookies. They also expire on
 > their own after a while, so re-copy them if private leagues stop loading.
 
@@ -482,7 +498,7 @@ Settings → **DraftKings lineups** → drop files on the box (or **browse**), o
 
 | Source | How to get it | What it adds |
 |---|---|---|
-| **Entries export (best)** | DraftKings website → *My Contests* → *Upcoming* (before lock) or *Live* → the export / download CSV option for NFL Classic entries | lineups + contest name, fee, entry IDs + a player/team table |
+| **Entries file `DKEntries.csv` (best)** | DraftKings website (desktop) → **Lineups** → **Edit Entries** → pick the NFL slate → **Download**. DK renames menus from time to time; you want the bulk "edit entries" download, which is the same file you'd upload back to DK. | lineups + contest name, fee, entry IDs + a player/team table |
 | **Upload CSV** | the file you edit for DK's bulk lineup upload (`QB,RB,RB,WR,WR,WR,TE,FLEX,DST` with `Name (ID)` cells) | lineups |
 | **DKSalaries.csv** (optional) | contest lobby → the contest → *Export to CSV* / download player list | exact teams + salaries for matching |
 | **Paste** | one lineup per line: `Name (ID), Name (ID), …` in QB, RB, RB, WR, WR, WR, TE, FLEX, DST order | lineups |
@@ -492,16 +508,23 @@ to swap in a new set, or untick it to add to what's there.
 
 If the DK panel lists any **unmatched** players, add DKSalaries.csv so the dashboard knows their teams.
 
+After kickoff DraftKings is reported to tag started players as `Name (ID) (LOCKED)`. Tags like that are ignored.
+If a slot still can't be read (empty, or a format the dashboard doesn't know), the lineup is kept, the import
+message lists the slot, and the lineup shows **⚠ N missing** with the panel saying **incomplete**, because its
+total is too low until you re-export or paste it.
+
 ### Refreshing each week
 
 1. After you finalize lineups (or after late swap), export again from DK.
 2. Settings → DraftKings → drop the new file with **replace existing lineups** ticked.
 3. Settings → **Clear DK data** wipes old lineups if you're not playing DFS that week.
 
-The feed and the live scoring reset with the NFL week automatically. Only the lineups need re-importing.
+The feed and the live scoring reset with the NFL week automatically (the feed is saved per season and week, so
+the first load of a new week starts empty). Only the lineups need re-importing.
 
 What the DK panel shows: live DK Classic points calculated from Sleeper's stats (including the 300/100/100 yard
-bonuses and DST points-allowed tiers), your best lineup, ranks among your own entries, players live / to go, and
+bonuses, defensive and special-teams fumble recoveries, and DST points-allowed tiers, which only count once that
+DST's game has kicked off, so a DST shows 0 until then), your best lineup, ranks among your own entries, players live / to go, and
 exposure. **Contest standings and payouts are only on DraftKings**, which is what the optional DK My Contests
 window is for.
 
@@ -511,9 +534,13 @@ window is for.
 
 | Symptom | Fix |
 |---|---|
-| **Red status dot / "Failed to fetch"** | Something blocked a request. Check your internet connection, then disable ad/tracker blockers *for this page* (uBlock, Privacy Badger, Brave Shields, a Pi-hole, a corporate firewall). The page needs `api.sleeper.app`, `api.sleeper.com`, `site.api.espn.com` and (ESPN leagues) `lm-api-reads.fantasy.espn.com`. |
+| **Amber status dot / "data 40s old · failing: …"** | One feed is failing, so part of the page is showing older data. The line names the feed and shows the real age. It retries on its own (slower after repeated errors). |
+| **Red status dot / "OFFLINE" / "Failed to fetch"** | Nothing fresh is getting through. Something blocked the requests. Check your internet connection, then disable ad/tracker blockers *for this page* (uBlock, Privacy Badger, Brave Shields, a Pi-hole, a corporate firewall). The page needs `api.sleeper.app`, `api.sleeper.com`, `site.api.espn.com` and (ESPN leagues) `lm-api-reads.fantasy.espn.com`. |
 | **"scores: fallback (no clock / red zone)"** | ESPN's scoreboard was unreachable, so scores come from Sleeper's schedule. Usually temporary. If it persists, an extension or network is blocking `site.api.espn.com`. |
-| **Stale data / "updated 90s ago"** | The tab was asleep. Bring the window forward, press `r` to refresh now, and exclude the site from Memory Saver / Sleeping tabs (§6). |
+| **Stale data / "paused (tab hidden)"** | The tab was hidden or asleep; it refreshes as soon as it's visible again. Press `r` to refresh now, and exclude the site from Memory Saver / Sleeping tabs (§6). |
+| **"next refresh 5 min (no games live)"** | Normal. With no game live it checks every 5 minutes (every minute on game days before kickoff), then switches back to your refresh rate. Press `r` any time. |
+| **DK "⚠ incomplete" / "N missing"** | A lineup slot couldn't be read from the file (see §8). Re-export `DKEntries.csv`, or paste that lineup. |
+| **Proxy says "origin or host not allowed"** | The page isn't on an allowed address (§1.D). Use the GitHub Pages link or `http://localhost`, or add your fork's address. |
 | **Player shows 0 while you can see he scored** | The live stats feed can lag a play or two. Give it 15–30 s. Stat corrections after games can change totals. |
 | **ESPN 401 / "private league"** | The league is private. Follow §7 ESPN private league. Check the **season** is right (a league ID from last year with this year's season, or the reverse, gives 401/404). |
 | **ESPN "rejected your espn_s2/SWID"** | The cookies expired or were copied wrong (SWID needs its `{braces}`). Re-copy both. |
@@ -542,7 +569,13 @@ pages. Run the stream in its own window next to it (§5).
 **Are the DraftKings points official?** No. They're calculated from live Sleeper stats with DK Classic scoring
 rules, and are usually spot-on during games. Your official score, rank and winnings are only on DraftKings.
 
-**Does it support Yahoo, NFL Fantasy, CBS, FanDuel or DK Showdown?** Not yet. Sleeper, ESPN and DK Classic only.
+**Does it support Yahoo, NFL Fantasy, CBS, FanDuel or DK Showdown?** Not yet. Sleeper, ESPN and DK Classic.
+Showdown files import with the 1.5× captain applied, but kickers score 0, so treat Showdown totals as rough.
+
+**Will the data feeds keep working?** Hopefully, but no promises. Only Sleeper's `api.sleeper.app/v1` API is
+officially documented. Sleeper's stats, projections and schedule feeds and both ESPN APIs are undocumented and can
+change or be blocked at any time. The dashboard keeps its traffic light (slower when nothing is live) to stay a
+polite client.
 
 **Can my buddies use it?** Yes. Send them the GitHub Pages link. Everyone enters their own leagues, and nothing is
 shared between people.
