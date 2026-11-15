@@ -252,25 +252,17 @@ test("Showdown: captain scores 1.5x and the import says so", () => {
 });
 
 const XSS = "<img src=x onerror=alert(1)>";
-test("M4: crafted names are escaped in the red-zone radar", () => {
+test("M4: crafted names reach the red-zone slot only as data (the board escapes them; see SETUP.md, XSS check)", () => {
   // the reported attack: a DST cell that ends in a team nickname resolves to that team and keeps the raw name
   const csv = LOCK_HDR + "558,G,1,$5,Pat Passer (4000010),,,,,,,,X " + XSS + " Chiefs (1000009),,\n";
   const s = SCC.buildState({ week: 10, season: "2026", scoreboard, stats, projections, dk: SCC.parseDK(csv) });
   const dst = s.dk.lineups[0].players.find(p => p.slot === "DST");
   assert.strictEqual(dst.sid, "KC");
-  assert.ok(s.interest.KC);
-  assert.strictEqual(s.interest.KC.name, "X " + XSS + " Chiefs");   // the raw name reaches the radar's data
-  assert.strictEqual(s.interest.KC.dk, 1);
-  const r = SCC.radarHTML(s.games, s.interest);                       // KC is in the red zone in the fixture
-  assert.strictEqual(r.count, 1);
-  assert.ok(!/<img/i.test(r.html), r.html);
-  assert.match(r.html, /&lt;img src=x onerror=alert\(1\)&gt;/);
-  // player names and opponents' names too
-  const html = SCC.radarHTML([{ id: '1"><script>', rz: true, poss: "KC", dd: XSS }], {
-    a: { name: "Pat " + XSS, team: "KC", mine: ["L"], opp: [], dk: 0 },
-    b: { name: "Opp <script>alert(1)</script>", team: "KC", mine: [], opp: ["L"], dk: 0 } }).html;
-  assert.ok(!/<img|<script/i.test(html), html);
-  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.strictEqual(s.interest.KC.name, "X " + XSS + " Chiefs");
+  const rz = SCC.redZone(s, true, "dfs");                              // KC is in the red zone in the fixture
+  assert.strictEqual(rz.status, "active");
+  assert.deepStrictEqual(rz.staked[0].cash, ["Passer"]);              // team defenses are never named on a drive
+  assert.strictEqual(SCC.esc(rz.staked[0].dd + XSS).indexOf("<"), -1);
 });
 
 test("esc() and safeUrl()", () => {
@@ -343,4 +335,103 @@ test("display names: team defenses are not clipped", () => {
   assert.strictEqual(SCC.lastName("Green Bay Packers"), "Packers");
   assert.strictEqual(SCC.lastName("Chiefs"), "Chiefs");
   assert.strictEqual(SCC.lastName("Amon-Ra St. Brown"), "St. Brown");
+});
+
+/* ------------------------------------------------------------ redesign: pure view-model helpers */
+const mu = (wp, me, opp, extra) => Object.assign({ leagueId: "L" + wp, league: "L", winProb: wp,
+  me: Object.assign({ pts: 50, remainProj: 10, yet: 1, playing: 2 }, me), opp: Object.assign({ pts: 40, remainProj: 10, yet: 1, playing: 2 }, opp) }, extra);
+
+test("layout follows the window's shape; ?view= forces one and the old view=all means board", () => {
+  assert.strictEqual(SCC.chooseLayout(1920, 1080), "board");
+  assert.strictEqual(SCC.chooseLayout(2560, 1440), "board");
+  assert.strictEqual(SCC.chooseLayout(1280, 2160), "rail");
+  assert.strictEqual(SCC.chooseLayout(480, 1080), "rail");
+  assert.strictEqual(SCC.chooseLayout(2560, 720), "strip");
+  assert.strictEqual(SCC.chooseLayout(1440, 270), "strip");
+  assert.strictEqual(SCC.chooseLayout(1366, 768), "board");
+  assert.strictEqual(SCC.chooseLayout(1920, 1080, "all"), "board");
+  assert.strictEqual(SCC.chooseLayout(1920, 1080, "rail"), "rail");
+  assert.strictEqual(SCC.chooseLayout(480, 1080, "strip"), "strip");
+  assert.strictEqual(SCC.chooseLayout(1920, 1080, "bogus"), "board");
+});
+
+test("verdict uses win probability, not the score, and becomes a record after the last game", () => {
+  assert.strictEqual(SCC.verdict([mu(0.8), mu(0.45), mu(0.08)]).text, "Favored in 1 of 3");
+  assert.strictEqual(SCC.verdict([mu(0.8), mu(0.45), mu(0.08)]).toss, 1);
+  assert.deepStrictEqual(SCC.verdict([mu(0.8), mu(0.45), mu(0.08)]).pips, ["ahead", "toss", "behind"]);
+  assert.strictEqual(SCC.verdict([mu(0.7), mu(0.9)]).text, "Favored in all 2");
+  assert.strictEqual(SCC.verdict([mu(0.2), mu(0.1)]).text, "Behind in all 2");
+  // behind on the scoreboard but favored (more players left) reads as favored
+  assert.strictEqual(SCC.verdict([mu(0.75, { pts: 20 }, { pts: 60 })]).text, "Favored to win");
+  assert.strictEqual(SCC.verdict([mu(0.5)]).text, "Too close to call");
+  const done = { remainProj: 0, yet: 0, playing: 0 };
+  assert.strictEqual(SCC.verdict([mu(1, Object.assign({ pts: 90 }, done), Object.assign({ pts: 80 }, done)), mu(0, Object.assign({ pts: 70 }, done), Object.assign({ pts: 75 }, done))]).text, "Won 1, lost 1");
+  assert.strictEqual(SCC.verdict([]).text, "");
+  assert.strictEqual(SCC.verdict([{ league: "bye", me: { pts: 1 }, opp: null, winProb: null }]).text, "");
+});
+
+test("not updating: a failed league keeps its last card with a tag, in the order leagues were added", () => {
+  const a = mu(0.6, {}, {}, { leagueId: "a" }), b = mu(0.4, {}, {}, { leagueId: "b" }), c = mu(0.5, {}, {}, { leagueId: "c" });
+  const good = { b: { m: JSON.parse(JSON.stringify(b)), t: 1000 } };
+  // b's fetch failed and returned nothing: its last good card comes back, tagged, in its place
+  let out = SCC.keepStale([c, a], good, { b: true }, ["a", "b", "c"]);
+  assert.deepStrictEqual(out.map(m => m.leagueId), ["a", "b", "c"]);
+  assert.strictEqual(out[1].notUpdating, 1000);
+  assert.strictEqual(out[0].notUpdating, undefined);
+  // b failed but a cached copy came back: still tagged with when it last really updated
+  out = SCC.keepStale([a, mu(0.4, {}, {}, { leagueId: "b" })], good, { b: true }, ["a", "b"]);
+  assert.strictEqual(out[1].notUpdating, 1000);
+  // b recovered: the tag goes away
+  out = SCC.keepStale([a, b], good, {}, ["a", "b"]);
+  assert.strictEqual(out[1].notUpdating, undefined);
+  // failed with no earlier card: nothing invented
+  assert.deepStrictEqual(SCC.keepStale([a], {}, { z: true }, ["a"]).map(m => m.leagueId), ["a"]);
+  // unknown leagues go last, keeping their order
+  assert.deepStrictEqual(SCC.keepStale([c, a, b], {}, {}, ["b"]).map(m => m.leagueId), ["b", "c", "a"]);
+});
+
+test("red zone: never claims 'nobody inside the 20' when the live game feed is down", () => {
+  const s = SCC.buildState({ week: 10, season: "2026", scoreboard, stats, projections,
+    sleeper: { userId: "me", leagues: [{ league: { name: "L1", league_id: "1", scoring_settings: { rec: 1 } },
+      users: [{ user_id: "me", display_name: "Me" }, { user_id: "op", display_name: "Op" }],
+      rosters: [{ roster_id: 1, owner_id: "me" }, { roster_id: 2, owner_id: "op" }],
+      matchups: [{ roster_id: 1, matchup_id: 1, starters: ["100"], starters_points: [22.4], points: 22.4 }, { roster_id: 2, matchup_id: 1, starters: ["200"], starters_points: [20.4], points: 20.4 }] }] } });
+  assert.strictEqual(SCC.redZone(s, true, "fantasy").status, "active");
+  assert.deepStrictEqual(SCC.redZone(s, true, "fantasy").staked[0].mine, ["Passer"]);
+  assert.strictEqual(SCC.redZone(s, false, "fantasy").status, "offline");          // feed failed, only old data left
+  const fb = SCC.buildState({ week: 10, season: "2026", schedule: [{ week: 10, status: "in_game", date: "2026-11-15", home: "ATL", away: "KC", game_id: "g" }], stats, projections });
+  assert.strictEqual(fb.scoreSource, "sleeper-schedule");
+  assert.strictEqual(SCC.redZone(fb, true, "fantasy").status, "offline");          // Sleeper fallback has no red zone
+  const quiet = JSON.parse(JSON.stringify(s)); quiet.games.forEach(g => { g.rz = false; });
+  assert.strictEqual(SCC.redZone(quiet, true, "fantasy").status, "none");
+  const pre = JSON.parse(JSON.stringify(s)); pre.games.forEach(g => { g.rz = false; g.state = "pre"; });
+  assert.strictEqual(SCC.redZone(pre, true, "fantasy").status, "pregame");
+  // inside the 20 but nobody has the ball (timeout, review): no blank team name
+  const noPoss = JSON.parse(JSON.stringify(s)); noPoss.games.forEach(g => { if (g.rz) g.poss = null; });
+  assert.deepStrictEqual(SCC.redZone(noPoss, true, "fantasy").other, []);
+  // a leagues-only window never names DraftKings players, and a DraftKings-only window never names league players
+  assert.deepStrictEqual(SCC.redZone(s, true, "dfs").staked, []);
+});
+
+test("schedule fallback doesn't pretend to know kickoff times", () => {
+  const sb = SCC.scheduleToScoreboard([{ week: 10, status: "pre_game", date: "2026-11-16", home: "BAL", away: "LAC", game_id: "g2" }], 10, stats);
+  assert.strictEqual(sb.games[0].kickTBD, true);
+  assert.strictEqual(sb.games[0].state, "pre");
+});
+
+test("settings migrate once from the first version's storage", () => {
+  const old = { display: "1440p", espn: [{ leagueId: "123", season: "2026", teamId: 3, teamName: "T" }, null], espnS2: "s2", espnSwid: "{sw}", proxyUrl: "http://localhost:8766",
+    username: "someone", userId: "42", displayName: "Someone", hidden: [7], redzoneUrl: "javascript:alert(1)", sound: true, zoom: 1.2, minDelta: 2, poll: 30 };
+  const m = SCC.migrateSettings(old, { lineups: [{}] });
+  assert.strictEqual(m.userId, "42");
+  assert.deepStrictEqual(m.hidden, ["7"]);
+  assert.strictEqual(m.espn.length, 1);
+  assert.strictEqual(m.textSize, 1.2);
+  assert.strictEqual(m.redzoneUrl, "");            // unsafe links don't survive the move
+  assert.strictEqual(m.dfsOn, true);               // had lineups, so DraftKings stays on
+  assert.strictEqual(m.poll, 30);
+  assert.strictEqual(m.display, undefined);        // display presets are gone; the window's shape decides
+  assert.strictEqual(SCC.migrateSettings({ zoom: 1 }, null).dfsOn, false);
+  assert.strictEqual(SCC.migrateSettings({ zoom: 1 }, null).textSize, undefined);
+  assert.strictEqual(SCC.migrateSettings(null), null);
 });

@@ -13,6 +13,9 @@ Cookies come from (first match wins):
   3. env vars ESPN_S2 / ESPN_SWID.
 Nothing is logged or stored. Only lm-api-reads.fantasy.espn.com league reads are allowed, so this is not an open proxy.
 
+Optional: GET /scores?dates=...&seasontype=...&week=... returns ESPN's public NFL scoreboard
+(site.api.espn.com), for a browser that can't load it directly. No cookies are ever sent with it.
+
 Who may call it (so other websites open in your browser can't use your cookies):
   - pages served from https://ewo8om3.github.io, http://localhost:<any port> or http://127.0.0.1:<any port>
   - extra origins (e.g. your own fork's GitHub Pages) in SCC_ALLOWED_ORIGINS (comma-separated) or
@@ -29,7 +32,9 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 HERE = os.path.dirname(os.path.abspath(__file__))
 UPSTREAM = "https://lm-api-reads.fantasy.espn.com"
 ALLOWED = re.compile(r"^/apis/v3/games/ffl/seasons/\d{4}/segments/0/leagues/\d+(\?[A-Za-z0-9_=&%.\-]*)?$")
-VERSION = "2"
+SCORES_UPSTREAM = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+SCORES_QUERY = re.compile(r"^(\?[A-Za-z0-9_=&%.\-]*)?$")
+VERSION = "3"
 DEFAULT_ORIGINS = {"https://ewo8om3.github.io"}
 LOOPBACK_ORIGIN = re.compile(r"^http://(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?$")
 LOOPBACK_HOST = re.compile(r"^(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?$")
@@ -139,9 +144,21 @@ class Handler(BaseHTTPRequestHandler):
         if self.path in ("/health", "/health/"):
             s2, swid = file_cookies()
             return self.reply(200, json.dumps({"ok": True, "app": "sunday-command-center-espn-proxy", "version": VERSION,
-                                               "cookiesInConfig": bool(s2 and swid)}).encode())
+                                               "cookiesInConfig": bool(s2 and swid), "scores": True}).encode())
+        if self.path == "/scores" or self.path.startswith("/scores?"):
+            q = self.path[len("/scores"):]
+            if not SCORES_QUERY.match(q):
+                return self.reply(403, b'{"error":"bad scoreboard query"}')
+            req = urllib.request.Request(SCORES_UPSTREAM + q, headers={"User-Agent": "Mozilla/5.0 (SundayCommandCenter helper)", "Accept": "application/json"})
+            try:
+                with OPENER.open(req, timeout=20) as r:
+                    return self.reply(r.status, r.read())
+            except urllib.error.HTTPError as e:
+                return self.reply(502 if 300 <= e.code < 400 else e.code, b'{"error":"scoreboard unavailable"}')
+            except Exception as e:
+                return self.reply(502, json.dumps({"error": str(e)}).encode())
         if not self.path.startswith("/espn/"):
-            return self.reply(404, b'{"error":"use /espn/apis/v3/..."}')
+            return self.reply(404, b'{"error":"use /espn/apis/v3/... or /scores"}')
         path = self.path[len("/espn"):]
         if not ALLOWED.match(path):
             return self.reply(403, b'{"error":"only ESPN fantasy football league reads are proxied"}')

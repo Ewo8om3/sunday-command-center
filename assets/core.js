@@ -225,7 +225,9 @@
     return { games: games, teamGame: teamGame };
   }
 
-  /* Fallback when ESPN is unreachable: Sleeper's schedule (status only) + DEF points allowed as the score. */
+  /* Fallback when ESPN is unreachable: Sleeper's schedule (status only) + DEF points allowed as the score.
+   * Sleeper's schedule has a date but no kickoff time, so kick is a placeholder (used only for polling) and
+   * kickTBD tells the UI not to show it as a time. */
   function scheduleToScoreboard(schedule, week, stats) {
     var pa = {};
     (stats || []).forEach(function (r) { if (/^[A-Z]+$/.test(r.player_id)) pa[r.player_id] = num((r.stats || {}).pts_allow); });
@@ -234,7 +236,7 @@
       var state = s.status === "complete" ? "post" : s.status === "in_game" ? "in" : "pre";
       var g = { id: s.game_id, kick: s.date + "T17:00:00Z", away: s.away, home: s.home, as: Math.round(pa[s.home] || 0), hs: Math.round(pa[s.away] || 0),
         state: state, detail: state === "in" ? "Live" : state === "post" ? "Final" : s.date, poss: null, rz: false, dd: "", last: "", tv: "",
-        remain: state === "pre" ? 1 : state === "post" ? 0 : 0.5, fallback: true };
+        remain: state === "pre" ? 1 : state === "post" ? 0 : 0.5, fallback: true, kickTBD: true };   // Sleeper gives a date, not a time
       games.push(g); teamGame[g.away] = g; teamGame[g.home] = g;
     });
     return { games: games, teamGame: teamGame };
@@ -524,23 +526,93 @@
     if (NICK[norm(n)]) return n;
     return p.length > 1 ? p.slice(1).join(" ") : n;
   }
-  /* Red-zone radar rows. Every name is escaped; only our own markup is added. */
-  function radarHTML(games, interest) {
-    var rz = (games || []).filter(function (g) { return g.rz; });
-    var rows = rz.map(function (g) {
-      var mine = [], opp = [];
-      Object.keys(interest || {}).forEach(function (pid) {
-        var x = interest[pid];
-        if (x.team !== g.poss) return;
-        if (x.mine.length || x.dk) mine.push(esc(lastName(x.name)) + (x.dk ? '<sup class="tag dk">DK' + (+x.dk || 0) + "</sup>" : ""));
-        if (x.opp.length) opp.push(esc(lastName(x.name)));
-      });
-      return '<div class="row" data-game="' + esc(g.id) + '"><div class="g">' + esc(g.poss) + ' <span style="color:var(--dim)">' + esc(g.dd) + "</span></div>" +
-        '<div class="who">' + (mine.length ? '<span style="color:var(--good)">\u25b2 ' + mine.join(", ") + "</span> " : "") +
-        (opp.length ? '<span style="color:var(--bad)">\u25bc ' + opp.join(", ") + "</span>" : "") +
-        (!mine.length && !opp.length ? '<span style="color:var(--dim)">none of your guys on offense</span>' : "") + "</div></div>";
+  /* ------------------------------------------------------------ UI view-model helpers (pure, tested in Node) */
+  /* Layout from the window's shape. ?view= forces one; the old ?view=all maps to board. */
+  function chooseLayout(w, h, force) {
+    force = String(force || "").toLowerCase();
+    if (force === "all") force = "board";
+    if (force === "board" || force === "rail" || force === "strip") return force;
+    var a = w / Math.max(1, h);
+    return a < 0.85 ? "rail" : a > 2.5 ? "strip" : "board";
+  }
+  function muStatus(m) { var wp = m.winProb; return wp == null || !m.opp ? "bye" : wp >= 0.6 ? "ahead" : wp <= 0.4 ? "behind" : "toss"; }
+  function muFinished(m) { return !!m.opp && m.me.remainProj + m.opp.remainProj < 0.5 && (m.me.pts > 0 || m.opp.pts > 0) && !m.me.yet && !m.opp.yet && !m.me.playing && !m.opp.playing; }
+  /* The header sentence. Uses win probability, not the current score; after the last game, wins and losses. */
+  function verdict(matchups) {
+    var ms = (matchups || []).filter(function (m) { return m.opp; }), n = ms.length, a = 0, t = 0, b = 0, fin = n > 0 && ms.every(muFinished);
+    var won = 0;
+    ms.forEach(function (m) { var s = muStatus(m); s === "ahead" ? a++ : s === "toss" ? t++ : b++; if (m.me.pts >= m.opp.pts) won++; });
+    var text;
+    if (!n) text = "";
+    else if (fin) text = n === 1 ? (won ? "You won" : "You lost") : "Won " + won + ", lost " + (n - won);
+    else if (n === 1) text = a ? "Favored to win" : t ? "Too close to call" : "Behind right now";
+    else if (a === n) text = "Favored in all " + n;
+    else if (b === n) text = "Behind in all " + n;
+    else text = "Favored in " + a + " of " + n;
+    return { text: text, toss: !fin && n > 1 ? t : 0, pips: ms.map(muStatus), final: fin };
+  }
+  /* "Not updating": a league whose feed failed keeps its last good card, tagged with when it last updated.
+   * ms: matchups built this refresh; lastGood: {leagueId: {m, t}} from earlier refreshes; failed: {leagueId: true}
+   * for leagues whose fetch failed this refresh; order: league ids in the order they were added.
+   * Returns the cards to show, in that order, with m.notUpdating = ms timestamp for stale ones. */
+  function keepStale(ms, lastGood, failed, order) {
+    lastGood = lastGood || {}; failed = failed || {}; order = order || [];
+    var out = [], seen = {};
+    (ms || []).forEach(function (m) {
+      var id = String(m.leagueId);
+      seen[id] = 1;
+      if (failed[id]) m.notUpdating = lastGood[id] ? lastGood[id].t : (m.notUpdating || Date.now());
+      else delete m.notUpdating;
+      out.push(m);
     });
-    return { count: rz.length, html: rows.join("") };
+    Object.keys(failed).forEach(function (id) {
+      if (seen[id] || !failed[id] || !lastGood[id]) return;
+      var m = JSON.parse(JSON.stringify(lastGood[id].m));
+      m.notUpdating = lastGood[id].t;
+      out.push(m);
+    });
+    var rank = function (m) { var i = order.indexOf(String(m.leagueId)); return i < 0 ? 1e6 : i; };
+    return out.map(function (m, i) { return { m: m, i: i }; })
+      .sort(function (x, y) { return rank(x.m) - rank(y.m) || x.i - y.i; }).map(function (x) { return x.m; });
+  }
+  /* Red-zone slot. feedLive is false when the live game feed (ESPN scoreboard) is down or only stale data is
+   * left, and then the answer is "offline", never "nobody is inside the 20".
+   * mode: "fantasy" | "both" | "dfs" decides whose players are named. */
+  function redZone(state, feedLive, mode) {
+    mode = mode || "fantasy";
+    var games = (state && state.games) || [], interest = (state && state.interest) || {};
+    if (!state || state.scoreSource !== "espn" || !feedLive) return { status: "offline", staked: [], other: [] };
+    var staked = [], other = [];
+    games.filter(function (g) { return g.rz && g.state === "in" && g.poss; }).forEach(function (g) {   // no possessing team (timeout, review): nothing to name
+      var mine = [], opp = [], cash = [];
+      Object.keys(interest).forEach(function (pid) {
+        var x = interest[pid];
+        if (x.team !== g.poss || /^[A-Z]+$/.test(pid)) return;     // team defenses aren't on the field for a drive
+        var nm = lastName(x.name);
+        if (mode !== "dfs" && x.mine.length) mine.push(nm);
+        if (mode !== "dfs" && x.opp.length) opp.push(nm);
+        if (mode !== "fantasy" && x.dk && !(mode === "both" && x.mine.length)) cash.push(nm);
+      });
+      (mine.length || opp.length || cash.length ? staked : other).push({ game: g.id, team: g.poss, dd: g.dd, mine: mine, opp: opp, cash: cash });
+    });
+    var live = games.some(function (g) { return g.state === "in"; });
+    var status = staked.length || other.length ? "active" : live ? "none" : games.some(function (g) { return g.state === "pre"; }) ? "pregame" : "done";
+    return { status: status, staked: staked, other: other };
+  }
+  /* One-time move from the first version's storage keys (scc.*.v1) to the redesign's (scc2.*). */
+  function migrateSettings(old, oldDk) {
+    if (!old || typeof old !== "object") return null;
+    var out = {};
+    ["username", "userId", "displayName", "espnS2", "espnSwid", "proxyUrl", "redzoneUrl", "sound", "minDelta", "poll", "noWake"].forEach(function (k) {
+      if (old[k] != null && old[k] !== "") out[k] = old[k];
+    });
+    if (Array.isArray(old.hidden)) out.hidden = old.hidden.map(String);
+    if (Array.isArray(old.espn)) out.espn = old.espn.filter(function (c) { return c && c.leagueId; });
+    var z = parseFloat(old.zoom);
+    if (isFinite(z) && z > 0 && Math.abs(z - 1) > 0.001) out.textSize = Math.max(0.8, Math.min(1.4, Math.round(z * 100) / 100));
+    if (out.redzoneUrl) out.redzoneUrl = safeUrl(out.redzoneUrl);
+    out.dfsOn = !!(oldDk && Array.isArray(oldDk.lineups) && oldDk.lineups.length);   // they were using DraftKings
+    return out;
   }
 
   /* ------------------------------------------------------------ data freshness + polling */
@@ -588,6 +660,8 @@
   return { ESPN_HOST: ESPN_HOST, espnPath: espnPath, espnTeams: espnTeams, buildESPN: buildESPN, urls: urls, norm: norm, dkPoints: dkPoints, tdCount: tdCount, parseCSV: parseCSV, parseDK: parseDK,
     parseScoreboard: parseScoreboard, scheduleToScoreboard: scheduleToScoreboard, statMaps: statMaps, buildSleeper: buildSleeper, buildDK: buildDK,
     buildState: buildState, diffEvents: diffEvents, winProb: winProb, leaguePtsKey: leaguePtsKey, NICK: NICK,
-    esc: esc, safeUrl: safeUrl, parseCell: parseCell, lastName: lastName, radarHTML: radarHTML, dataStatus: dataStatus,
-    pollDelay: pollDelay, scoped: scoped, buildInterest: buildInterest };
+    esc: esc, safeUrl: safeUrl, parseCell: parseCell, lastName: lastName, dataStatus: dataStatus,
+    pollDelay: pollDelay, scoped: scoped, buildInterest: buildInterest,
+    chooseLayout: chooseLayout, verdict: verdict, muStatus: muStatus, muFinished: muFinished, keepStale: keepStale, redZone: redZone,
+    migrateSettings: migrateSettings };
 });
