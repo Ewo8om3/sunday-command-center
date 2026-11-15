@@ -14,7 +14,8 @@ html,body{height:100%;background:var(--bg);color:var(--txt);font-family:"Inter",
 .hdr .meta{color:var(--dim);font-size:.85em;line-height:1.3}
 .hdr .sp{flex:1}
 .dot{display:inline-block;width:.6em;height:.6em;border-radius:50%;background:var(--good);margin-right:.35em}
-.dot.stale{background:var(--warn)}.dot.err{background:var(--bad)}
+.dot.stale{background:var(--warn)}.dot.err{background:var(--bad)}.dot.idle{background:var(--dim)}
+.st-stale{color:var(--warn)}.st-offline{color:var(--bad);font-weight:700}
 .kbd{border:1px solid var(--line);border-radius:.3em;padding:0 .35em;font-size:.75em;color:var(--dim)}
 /* radar */
 .radar{display:flex;flex-direction:column;gap:.35em}
@@ -142,6 +143,10 @@ code{background:#0e141c;padding:0 4px;border-radius:4px}
 .view-strip .dkwrap,.view-strip .dkwrap>.scroll{min-height:0}
 .view-strip .lus{height:100%;grid-auto-rows:1fr}
 .view-strip .lu .pl{flex:1}
+.lutable td{padding:.12em .4em;white-space:nowrap}
+.lutable td.who{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:0;width:100%}
+.lutable tr.best td{color:var(--dk)}
+.lutable .who .pre{color:var(--dim)}.lutable .who .post{opacity:.6}.lutable .who .in{color:var(--txt)}.lutable .who .rz{color:var(--rz);font-weight:700}
 .expo{width:16em}
 .view-all .dkwrap{grid-template-columns:1fr;grid-template-rows:auto minmax(0,1fr)}
 .view-all .expo{width:auto}

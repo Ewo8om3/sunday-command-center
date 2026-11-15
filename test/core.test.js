@@ -32,7 +32,8 @@ test("DK scoring incl. bonuses, fumbles and DST tiers", () => {
   assert.strictEqual(SCC.dkPoints(stats[0].stats, "QB"), 23.6);
   assert.strictEqual(SCC.dkPoints(stats[1].stats, "RB"), 10.4 + 6 + 3 + 2 - 1 + 3);
   assert.strictEqual(SCC.dkPoints(stats[2].stats, "DEF"), 3 + 2 + 1);
-  assert.strictEqual(SCC.dkPoints({}, "DST"), 10);
+  assert.strictEqual(SCC.dkPoints({}, "DST", "in"), 10);    // live and nothing allowed yet = shutout tier
+  assert.strictEqual(SCC.dkPoints({}, "DST", "pre"), 0);    // not started: no points-allowed tier
 });
 
 test("ESPN scoreboard parsing, red-zone inference, WSH->WAS", () => {
@@ -132,4 +133,214 @@ test("ESPN league -> normalized matchup card", () => {
   assert.strictEqual(m.winProb, 0.7);
   assert.strictEqual(m.opp.name, "Beta Bots");
   assert.deepStrictEqual(s.interest["100"].mine, ["ESPN Test"]);
+});
+
+/* ---------------------------------------------------------------- review fixes */
+
+test("M1: DST points-allowed tier only once the game is live or final", () => {
+  assert.strictEqual(SCC.dkPoints({}, "DST"), 0);                         // no stats, no state: not started
+  assert.strictEqual(SCC.dkPoints({}, "DST", "pre"), 0);
+  assert.strictEqual(SCC.dkPoints({}, "DST", "bye"), 0);
+  assert.strictEqual(SCC.dkPoints({ sack: 2 }, "DST", "pre"), 2);
+  assert.strictEqual(SCC.dkPoints({}, "DST", "post"), 10);                // real shutout (Sleeper omits pts_allow = 0)
+  assert.strictEqual(SCC.dkPoints({ gp: 1, pts_allow_0: 1 }, "DST"), 10); // no state, stats show it played
+  assert.strictEqual(SCC.dkPoints({ pts_allow: 17 }, "DST"), 1);
+  assert.strictEqual(SCC.dkPoints({ pts_allow: 3 }, "DST", "proj"), 7);
+});
+
+test("M1: a pre-game DST adds 0 to a DK lineup until kickoff", () => {
+  const sal = { "4000090": { name: "Cowboys", pos: "DST", team: "DAL" } };
+  const st = [{ player_id: "DAL", team: "DAL", player: { first_name: "Dallas", last_name: "Cowboys", position: "DEF", team: "DAL" }, stats: {} }];
+  const dk = { lineups: [{ players: [{ slot: "DST", name: "Cowboys", dkId: "4000090" }] }], salaries: sal };
+  const pre = SCC.buildState({ week: 10, season: "2026", scoreboard, stats: st, projections: [], dk });
+  assert.strictEqual(pre.games.find(g => g.home === "DAL").state, "pre");
+  assert.strictEqual(pre.dk.lineups[0].players[0].pts, 0);
+  assert.strictEqual(pre.dk.lineups[0].pts, 0);
+  assert.strictEqual(pre.interest.DAL.dkpts, 0);
+  const live = JSON.parse(JSON.stringify(scoreboard));
+  live.events[1].status = { period: 1, clock: 800, type: { state: "in", shortDetail: "13:20 - 1st" } };
+  const inG = SCC.buildState({ week: 10, season: "2026", scoreboard: live, stats: st, projections: [], dk });
+  assert.strictEqual(inG.dk.lineups[0].players[0].pts, 10);
+});
+
+test("DK DST: every points-allowed tier boundary and all DST events", () => {
+  const t = pa => SCC.dkPoints({ pts_allow: pa }, "DST", "post");
+  assert.deepStrictEqual([0, 1, 6, 7, 13, 14, 20, 21, 27, 28, 34, 35, 50].map(t), [10, 7, 7, 4, 4, 1, 1, 0, 0, -1, -1, -4, -4]);
+  // sack 1, int 2, fumble recoveries (defense + special teams) 2 each, TDs 6, safety 2, blocked kick 2, 2pt return 2
+  const all = { pts_allow: 24, sack: 3, int: 1, fum_rec: 1, def_st_fum_rec: 1, def_td: 1, def_st_td: 1, safe: 1, blk_kick: 1, def_2pt: 1 };
+  assert.strictEqual(SCC.dkPoints(all, "DST", "post"), 3 + 2 + 2 + 2 + 6 + 6 + 2 + 2 + 2 + 0);
+});
+
+test("S3: special-teams fumble recoveries count for the DST", () => {
+  assert.strictEqual(SCC.dkPoints({ pts_allow: 24, def_st_fum_rec: 1 }, "DST", "post"), 2);
+  assert.strictEqual(SCC.dkPoints({ pts_allow: 24, fum_rec: 2, def_st_fum_rec: 1 }, "DST", "post"), 6);
+});
+
+test("DK offense: bonuses at the edges, 2-pt conversions, return and fumble-recovery TDs", () => {
+  const p = s => SCC.dkPoints(s, "WR");
+  assert.strictEqual(p({ pass_yd: 299 }), 11.96);
+  assert.strictEqual(p({ pass_yd: 300 }), 15);
+  assert.strictEqual(p({ rush_yd: 99 }), 9.9);
+  assert.strictEqual(p({ rush_yd: 100 }), 13);
+  assert.strictEqual(p({ rec_yd: 99, rec: 5 }), 14.9);
+  assert.strictEqual(p({ rec_yd: 100, rec: 5 }), 18);
+  assert.strictEqual(p({ pass_2pt: 1, rush_2pt: 1, rec_2pt: 1 }), 6);
+  assert.strictEqual(p({ kr_td: 1, pr_td: 1 }), 12);
+  assert.strictEqual(p({ fum_rec_td: 1 }), 6);                 // offensive fumble recovery TD
+  assert.strictEqual(p({ pass_int: 2, fum_lost: 1 }), -3);
+  assert.strictEqual(SCC.tdCount({ rec_td: 1, fum_rec_td: 1, kr_td: 1 }), 3);
+});
+
+const LOCK_HDR = "Entry ID,Contest Name,Contest ID,Entry Fee,QB,RB,RB,WR,WR,WR,TE,FLEX,DST,,Instructions\n";
+const lockedRow = "556,NFL $5 Test GPP,999,$5,Pat Passer (4000010) (LOCKED),Rob Runner Jr. (4000020) (LOCKED),A B (4000030) (LOCKED),Will Wideout (4000040) (LOCKED)," +
+  "C D (4000050),E F (4000060),G H (4000070),I J (4000080),Chiefs (4000090) (LOCKED),,\n";
+
+test("M2: ' (LOCKED)' and similar tags are stripped; no lineup is dropped", () => {
+  const r = SCC.parseDK(LOCK_HDR + lockedRow);
+  assert.strictEqual(r.lineups.length, 1);
+  assert.strictEqual(r.lineups[0].players.length, 9);
+  assert.strictEqual(r.lineups[0].players[0].name, "Pat Passer");
+  assert.strictEqual(r.lineups[0].players[8].slot, "DST");
+  assert.strictEqual(r.lineups[0].players[8].dkId, "4000090");
+  assert.deepStrictEqual(r.lineups[0].missing, []);
+  assert.deepStrictEqual(r.warnings, []);
+  assert.deepStrictEqual(SCC.parseCell("Pat Passer (LOCKED) (4000010)"), { name: "Pat Passer", dkId: "4000010" });
+  assert.deepStrictEqual(SCC.parseCell("Pat Passer (4000010) (Locked) (Q)"), { name: "Pat Passer", dkId: "4000010" });
+  // pasted line with locked tags
+  const pasted = SCC.parseDK(lockedRow.split(",").slice(4, 13).join(","));
+  assert.strictEqual(pasted.lineups[0].players.length, 9);
+});
+
+test("M2: unreadable or empty slots are kept and reported, never silently dropped", () => {
+  const row = "557,NFL $5 Test GPP,999,$5,Pat Passer (4000010),,A B (4000030),LOCKED,LOCKED,LOCKED,LOCKED,I J (4000080),Chiefs (4000090),,\n";
+  const r = SCC.parseDK(LOCK_HDR + row);
+  assert.strictEqual(r.lineups.length, 1);                      // 4 bad cells: previously the whole lineup vanished
+  assert.strictEqual(r.lineups[0].players.length, 4);
+  assert.deepStrictEqual(r.lineups[0].missing.map(x => x.slot), ["RB", "WR", "WR", "WR", "TE"]);
+  assert.strictEqual(r.warnings.length, 1);
+  assert.match(r.warnings[0], /entry 557.*5 slots not read: RB \(empty\), WR .LOCKED./);
+  const s = SCC.buildState({ week: 10, season: "2026", scoreboard, stats, projections, dk: r });
+  assert.deepStrictEqual(s.dk.incomplete, [{ n: 1, entry: "557", slots: ["RB", "WR", "WR", "WR", "TE"], cells: ["", "LOCKED", "LOCKED", "LOCKED", "LOCKED"] }]);
+  // an older saved lineup with fewer players lists the Classic slots that are absent
+  const old = SCC.buildDK({ lineups: [{ players: [{ slot: "QB", name: "Pat Passer", dkId: "4000010" }, { slot: "DST", name: "Chiefs", dkId: "4000090" }] }] },
+    SCC.statMaps(stats, projections), {});
+  assert.deepStrictEqual(old.incomplete[0].slots, ["RB", "RB", "WR", "WR", "WR", "TE", "FLEX"]);
+  // a short pasted Classic lineup is flagged too
+  const short = SCC.parseDK("Pat Passer (4000010), Rob Runner Jr. (4000020)");
+  assert.strictEqual(short.lineups.length, 1);
+  assert.strictEqual(short.lineups[0].missing.length, 7);
+  assert.strictEqual(short.warnings.length, 1);
+});
+
+test("parseDK: DKSalaries.csv alone gives salaries, not fake lineups", () => {
+  const sal = "Position,Name + ID,Name,ID,Roster Position,Salary,Game Info,TeamAbbrev,AvgPointsPerGame\n" +
+    "QB,Pat Passer (4000010),Pat Passer,4000010,QB,7000,KC@ATL 11/15/2026 01:00PM ET,KC,21.1\n" +
+    "DST,Chiefs (4000090),Chiefs,4000090,DST,3000,KC@ATL 11/15/2026 01:00PM ET,KC,7.0\n";
+  const r = SCC.parseDK(sal);
+  assert.strictEqual(r.lineups.length, 0);
+  assert.strictEqual(r.salaries["4000090"].pos, "DST");
+});
+
+test("Showdown: captain scores 1.5x and the import says so", () => {
+  const sd = "CPT,FLEX,FLEX,FLEX,FLEX,FLEX\nPat Passer (4000010),Rob Runner Jr. (4000020),A B (4000030),C D (4000050),E F (4000060),G H (4000070)\n";
+  const r = SCC.parseDK(sd);
+  assert.strictEqual(r.lineups[0].showdown, true);
+  assert.ok(r.warnings.some(w => /Showdown/.test(w)));
+  const s = SCC.buildState({ week: 10, season: "2026", scoreboard, stats, projections, dk: r });
+  assert.strictEqual(s.dk.lineups[0].players[0].pts, 35.4);     // 23.6 x 1.5
+  assert.deepStrictEqual(s.dk.incomplete, []);
+});
+
+const XSS = "<img src=x onerror=alert(1)>";
+test("M4: crafted names are escaped in the red-zone radar", () => {
+  // the reported attack: a DST cell that ends in a team nickname resolves to that team and keeps the raw name
+  const csv = LOCK_HDR + "558,G,1,$5,Pat Passer (4000010),,,,,,,,X " + XSS + " Chiefs (1000009),,\n";
+  const s = SCC.buildState({ week: 10, season: "2026", scoreboard, stats, projections, dk: SCC.parseDK(csv) });
+  const dst = s.dk.lineups[0].players.find(p => p.slot === "DST");
+  assert.strictEqual(dst.sid, "KC");
+  assert.ok(s.interest.KC);
+  assert.strictEqual(s.interest.KC.name, "X " + XSS + " Chiefs");   // the raw name reaches the radar's data
+  assert.strictEqual(s.interest.KC.dk, 1);
+  const r = SCC.radarHTML(s.games, s.interest);                       // KC is in the red zone in the fixture
+  assert.strictEqual(r.count, 1);
+  assert.ok(!/<img/i.test(r.html), r.html);
+  assert.match(r.html, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  // player names and opponents' names too
+  const html = SCC.radarHTML([{ id: '1"><script>', rz: true, poss: "KC", dd: XSS }], {
+    a: { name: "Pat " + XSS, team: "KC", mine: ["L"], opp: [], dk: 0 },
+    b: { name: "Opp <script>alert(1)</script>", team: "KC", mine: [], opp: ["L"], dk: 0 } }).html;
+  assert.ok(!/<img|<script/i.test(html), html);
+  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
+});
+
+test("esc() and safeUrl()", () => {
+  assert.strictEqual(SCC.esc(XSS), "&lt;img src=x onerror=alert(1)&gt;");
+  assert.strictEqual(SCC.esc('"\'`&'), "&quot;&#39;&#96;&amp;");
+  assert.strictEqual(SCC.esc(null), "");
+  assert.strictEqual(SCC.safeUrl("javascript:alert(1)"), "");
+  assert.strictEqual(SCC.safeUrl(" data:text/html,x"), "");
+  assert.strictEqual(SCC.safeUrl("https://tv.youtube.com/"), "https://tv.youtube.com/");
+  assert.strictEqual(SCC.safeUrl('https://x.com/" onmouseover="a'), "");
+});
+
+test("M3: data status reflects the real age and failures, never green during an outage", () => {
+  const now = 1000000000;
+  const ok = (age, extra) => Object.assign({ ok: now - age * 1000, fails: 0, err: "", critical: true }, extra);
+  assert.strictEqual(SCC.dataStatus({}, now, 15).level, "connecting");
+  assert.strictEqual(SCC.dataStatus({ s: ok(5), e: ok(8) }, now, 15).level, "ok");
+  assert.strictEqual(SCC.dataStatus({ s: ok(5), e: ok(8) }, now, 15).age, 8);           // oldest critical source
+  // 45 s outage of one feed: cached data is shown, but amber with its real age
+  const out = SCC.dataStatus({ s: ok(50, { fails: 3, err: "timed out" }), e: ok(4) }, now, 15);
+  assert.strictEqual(out.level, "stale");
+  assert.strictEqual(out.age, 50);
+  assert.deepStrictEqual(out.failing, ["s"]);
+  // everything failing -> red
+  assert.strictEqual(SCC.dataStatus({ s: ok(50, { fails: 3 }), e: ok(40, { fails: 2 }) }, now, 15).level, "offline");
+  assert.strictEqual(SCC.dataStatus({ s: { ok: 0, fails: 1, critical: true } }, now, 15).level, "offline");
+  // one league that never loads doesn't hide the age of the feeds that work
+  const one = SCC.dataStatus({ s: ok(6), espn: { ok: 0, fails: 4, err: "ESPN 404", critical: true } }, now, 15);
+  assert.strictEqual(one.level, "stale");
+  assert.strictEqual(one.age, 6);
+  // no failures but data too old
+  assert.strictEqual(SCC.dataStatus({ s: ok(70) }, now, 15).level, "stale");
+  assert.strictEqual(SCC.dataStatus({ s: ok(400) }, now, 15).level, "offline");
+  // a non-critical failure (projections) still shows amber
+  assert.strictEqual(SCC.dataStatus({ s: ok(5), p: { ok: now, fails: 1, critical: false } }, now, 15).level, "stale");
+});
+
+test("S5: polling slows down when no game is live, and backs off on errors", () => {
+  const now = Date.parse("2026-11-15T15:00:00Z");
+  const g = (state, kickIso) => ({ state, kick: kickIso });
+  assert.strictEqual(SCC.pollDelay([g("in", "2026-11-15T14:00:00Z")], now, 15, 0), 15000);
+  assert.strictEqual(SCC.pollDelay([g("pre", "2026-11-15T15:10:00Z")], now, 15, 0), 15000);  // kickoff in 10 min
+  assert.strictEqual(SCC.pollDelay([g("pre", "2026-11-15T17:00:00Z")], now, 15, 0), 60000);  // later today
+  assert.strictEqual(SCC.pollDelay([g("post", "2026-11-15T12:00:00Z"), g("pre", "2026-11-19T01:00:00Z")], now, 15, 0), 300000);
+  assert.strictEqual(SCC.pollDelay([], now, 15, 0), 300000);
+  assert.strictEqual(SCC.pollDelay([g("in", "x")], now, 15, 1), 30000);
+  assert.strictEqual(SCC.pollDelay([g("in", "x")], now, 15, 9), 120000);   // capped at 8x
+  assert.strictEqual(SCC.pollDelay([], now, 15, 9), 300000);               // never more than 5 min
+});
+
+test("S4: feed and snapshot are week-scoped, so a new week starts clean", () => {
+  const stored = { season: "2026", week: 9, seasonType: "regular", data: [{ name: "x" }] };
+  assert.deepStrictEqual(SCC.scoped(stored, "2026", "9", "regular"), [{ name: "x" }]);
+  assert.strictEqual(SCC.scoped(stored, "2026", 10, "regular"), null);
+  assert.strictEqual(SCC.scoped(stored, "2026", 9, "post"), null);
+  assert.strictEqual(SCC.scoped([{ name: "old unscoped feed" }], "2026", 9), null);
+  assert.strictEqual(SCC.scoped(null, "2026", 9), null);
+});
+
+test("URLs: season type and week override reach every feed", () => {
+  const u = SCC.urls("2026", 2, "post", 2);
+  assert.match(u.stats, /season_type=post/);
+  assert.match(u.schedule, /\/post\/2026$/);
+  assert.match(u.scoreboard, /seasontype=3&week=2&dates=2026/);
+  assert.ok(!/\?/.test(SCC.urls("2026", 10).scoreboard));
+});
+
+test("display names: team defenses are not clipped", () => {
+  assert.strictEqual(SCC.lastName("New York Giants"), "Giants");
+  assert.strictEqual(SCC.lastName("Green Bay Packers"), "Packers");
+  assert.strictEqual(SCC.lastName("Chiefs"), "Chiefs");
+  assert.strictEqual(SCC.lastName("Amon-Ra St. Brown"), "St. Brown");
 });

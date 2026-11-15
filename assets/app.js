@@ -7,8 +7,22 @@
   var DEMO = qs.has("demo");
   var settings = load(LS.settings, { display: "auto", espn: [], espnS2: "", espnSwid: "", proxyUrl: "http://localhost:8766", username: "", userId: "", displayName: "", hidden: [], redzoneUrl: "", sound: false, zoom: 1, minDelta: 1.5, poll: 15 });
   var dkData = load(LS.dk, { lineups: [], salaries: {}, files: [], importedAt: null });
-  var feed = load(LS.feed, []);
-  var prevInterest = DEMO ? null : load(LS.prev, null);
+  /* The feed and the previous snapshot are saved with their season + week and discarded when the week changes
+     (so a new week doesn't flood the feed with "-33.5" events). Demo mode never touches the real feed. */
+  function loadRaw(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } }
+  var feedRaw = DEMO ? null : loadRaw(LS.feed), prevRaw = DEMO ? null : loadRaw(LS.prev);
+  var feed = [], prevInterest = null, weekKey = null;
+  function adoptWeek(st) {
+    var k = st.season + "|" + st.seasonType + "|" + st.week;
+    if (k === weekKey) return;
+    if (weekKey === null && !DEMO) {
+      feed = SCC.scoped(feedRaw, st.season, st.week, st.seasonType) || [];
+      prevInterest = SCC.scoped(prevRaw, st.season, st.week, st.seasonType);
+    } else { feed = []; prevInterest = null; hot = {}; }
+    weekKey = k;
+  }
+  function scopedSave(k, data) { if (!DEMO && S0) save(k, { season: S0.season, week: S0.week, seasonType: S0.seasonType, data: data }); }
+  var S0 = null;
   /* Display presets: layout split (fractions of the screen) + font divisors + density. */
   var DISPLAYS = {
     "1080p": { label: "1080p (1920×1080)", rz: [0.75, 0.75], rail: 30, strip: 9.5, all: 96, density: "compact" },
@@ -20,37 +34,65 @@
     return px >= 3000 ? "4k" : px >= 2300 ? "1440p" : "1080p";
   }
   function display() { var k = settings.display && DISPLAYS[settings.display] ? settings.display : detectDisplay(); return Object.assign({ key: k }, DISPLAYS[k]); }
-  var S = null, lastOk = 0, lastErr = "", focus = null, hot = {}, busy = false, timer = null;
+  var S = null, lastErr = "", focus = null, hot = {}, busy = false, timer = null, clockTimer = null, fails = 0, tickStarted = 0, paused = false, nextAt = 0;
   var app = document.getElementById("app");
 
   function load(k, d) { try { var v = JSON.parse(localStorage.getItem(k)); return v == null ? d : Object.assign(Array.isArray(d) ? [] : {}, d, v); } catch (e) { return d; } }
   function save(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { console.warn("localStorage", e); } }
-  function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
+  var esc = SCC.esc;   // every user-, file- or API-supplied string that goes into innerHTML passes through esc()
   function f1(x) { return (Math.round(x * 10) / 10).toFixed(1); }
   function f2(x) { return (Math.round(x * 100) / 100).toFixed(2); }
-  function last(n) { var p = String(n || "").split(" "); return p.length > 1 && !SCC.NICK[SCC.norm(n)] ? p.slice(1).join(" ") : n; }
-  function short(n) { var p = String(n || "").split(" "); return p.length > 1 ? p[0][0] + ". " + p.slice(1).join(" ") : n; }
-
-  /* ---------------------------------------------------------------- fetch with TTL */
-  var cache = {};
-  function getJSON(url, ttl) {
-    var c = cache[url], now = Date.now();
-    if (c && now - c.t < ttl * 1000) return Promise.resolve(c.v);
-    return fetch(url, { cache: "no-store" }).then(function (r) {
-      if (!r.ok) throw new Error(r.status + " " + url.replace(/\?.*/, ""));
-      return r.json();
-    }).then(function (v) { cache[url] = { t: now, v: v }; return v; })
-      .catch(function (e) { if (c) return c.v; throw e; });
+  var last = SCC.lastName;
+  function short(n) {
+    n = String(n == null ? "" : n); var p = n.split(" ");
+    var l = last(n);
+    if (SCC.NICK[SCC.norm(l)]) return l;   // team defense -> nickname
+    return p.length > 1 && p[0] ? p[0][0] + ". " + p.slice(1).join(" ") : n;
   }
+
+  /* ---------------------------------------------------------------- fetch with TTL + per-source health */
+  var cache = {}, health = {}, tickId = 0;
+  var TIMEOUT_MS = 12000;
+  function fetchT(url, opts) {   // fetch with a timeout, so one hung request can't stop refreshes
+    var ctl = typeof AbortController !== "undefined" ? new AbortController() : null, t;
+    opts = Object.assign({}, opts || {}, ctl ? { signal: ctl.signal } : {});
+    if (ctl) t = setTimeout(function () { ctl.abort(); }, TIMEOUT_MS);
+    return fetch(url, opts).then(function (r) { clearTimeout(t); return r; }, function (e) {
+      clearTimeout(t); throw (e && e.name === "AbortError") ? new Error("timed out") : e;
+    });
+  }
+  function mark(src, critical, okAt, err) {
+    if (!src) return;
+    var h = health[src] || (health[src] = { ok: 0, fails: 0, err: "", critical: !!critical });
+    h.critical = !!critical; h.seen = tickId;
+    if (err) { h.fails++; h.err = err; } else if (okAt) { h.ok = Math.max(h.ok, okAt); h.fails = 0; h.err = ""; }
+  }
+  /* opt: {src: name shown in the status line, critical: counts toward the data age, stale: false to throw
+     instead of falling back to the cached copy}. A fallback to cache is recorded as a failure, never as fresh. */
+  function getJSON(url, ttl, opt) {
+    opt = opt || {};
+    var c = cache[url], now = Date.now();
+    if (c && now - c.t < ttl * 1000) { mark(opt.src, opt.critical, c.t); return Promise.resolve(c.v); }
+    return fetchT(url, { cache: "no-store" }).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    }).then(function (v) { var t = Date.now(); cache[url] = { t: t, v: v }; mark(opt.src, opt.critical, t); return v; })
+      .catch(function (e) {
+        mark(opt.src, opt.critical, 0, (e && e.message) || "failed");
+        if (c && opt.stale !== false) return c.v;
+        throw e;
+      });
+  }
+  function isLoopback(u) { return /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(\/|$)/i.test(String(u || "").trim()); }
 
   /* ESPN fantasy: public leagues load directly (ESPN allows CORS). Private leagues try your browser's own
      ESPN login cookies, then the optional local proxy (proxy/espn_proxy.py) which adds espn_s2/SWID. */
   var espnMode = {};
-  function espnFetch(path, key) {
+  function espnFetch(path, key, src) {
     var c = cache[path];
-    if (c && Date.now() - c.t < 20000) return Promise.resolve(c.v);
+    if (c && Date.now() - c.t < 20000) { mark(src, true, c.t); return Promise.resolve(c.v); }
     function get(url, opts) {
-      return fetch(url, opts).then(function (r) {
+      return fetchT(url, opts).then(function (r) {
         if (r.status === 401 || r.status === 403) { var e = new Error("private"); e.auth = true; throw e; }
         if (!r.ok) throw new Error("ESPN " + r.status);
         return r.json();
@@ -58,6 +100,8 @@
     }
     function viaProxy() {
       var h = {};
+      // cookies only ever go to a proxy on this computer, never to another host typed into the Proxy field
+      if (!isLoopback(settings.proxyUrl)) return Promise.reject(new Error("ESPN private league: the Proxy URL must be http://localhost:<port> or http://127.0.0.1:<port>"));
       if (settings.espnS2 && settings.espnSwid) { h["X-Espn-S2"] = settings.espnS2; h["X-Espn-Swid"] = settings.espnSwid; }
       return get(settings.proxyUrl.replace(/\/$/, "") + "/espn" + path, { headers: h, credentials: "omit" })
         .catch(function (e) {
@@ -75,34 +119,41 @@
         return get(url, { credentials: "include" }).then(function (v) { espnMode[key] = "cookie"; return v; })
           .catch(function () { return viaProxy().then(function (v) { espnMode[key] = "proxy"; return v; }); });
       });
-    return p.then(function (v) { cache[path] = { t: Date.now(), v: v }; return v; }).catch(function (e) { if (c) return c.v; throw e; });
+    return p.then(function (v) { var t = Date.now(); cache[path] = { t: t, v: v }; mark(src, true, t); return v; })
+      .catch(function (e) { mark(src, true, 0, e.message || "failed"); if (c) return c.v; throw e; });
   }
 
   function gather() {
-    return getJSON("https://api.sleeper.app/v1/state/nfl", 600).then(function (st) {
+    return getJSON("https://api.sleeper.app/v1/state/nfl", 600, { src: "Sleeper week" }).then(function (st) {
       var season = qs.get("season") || st.league_season || st.season, week = qs.get("week") || st.display_week || st.week;
-      var U = SCC.urls(season, week);
+      var seasonType = qs.get("season_type") || (st.season_type === "post" ? "post" : "regular");
+      var U = SCC.urls(season, week, seasonType, qs.get("week"));
       var sleeperP;
       if (DEMO || !settings.userId) sleeperP = Promise.resolve(null);
-      else sleeperP = getJSON(U.leagues(settings.userId), 1800).then(function (ls) {
+      else sleeperP = getJSON(U.leagues(settings.userId), 1800, { src: "Sleeper leagues" }).then(function (ls) {
         ls = ls.filter(function (l) { return (l.status === "in_season" || l.status === "post_season") && settings.hidden.indexOf(l.league_id) < 0; });
         return Promise.all(ls.map(function (l) {
-          return Promise.all([getJSON(U.rosters(l.league_id), 900), getJSON(U.users(l.league_id), 3600), getJSON(U.matchups(l.league_id), 15)])
+          var nm = "Sleeper: " + String(l.name || l.league_id).trim();
+          return Promise.all([getJSON(U.rosters(l.league_id), 900, { src: nm + " rosters" }), getJSON(U.users(l.league_id), 3600, { src: nm + " users" }),
+            getJSON(U.matchups(l.league_id), 15, { src: nm, critical: true })])
             .then(function (a) { return { league: l, rosters: a[0], users: a[1], matchups: a[2] }; })
             .catch(function (e) { lastErr = l.name + ": " + e.message; return null; });
         }));
       }).then(function (L) { return { userId: settings.userId, leagues: L.filter(Boolean) }; });
       var espnP = DEMO ? Promise.resolve([]) : Promise.all((settings.espn || []).map(function (cfg) {
-        return espnFetch(SCC.espnPath(cfg.season || season, cfg.leagueId, week), cfg.leagueId + ":" + cfg.season)
+        return espnFetch(SCC.espnPath(cfg.season || season, cfg.leagueId, week), cfg.leagueId + ":" + cfg.season, "ESPN: " + (cfg.leagueName || cfg.leagueId))
           .then(function (d) { return { cfg: cfg, data: d }; })
           .catch(function (e) { lastErr = (cfg.leagueName || "ESPN " + cfg.leagueId) + ": " + e.message; return null; });
       })).then(function (a) { return a.filter(Boolean); });
-      var sbP = getJSON(U.scoreboard, 10).then(function (sb) { return { sb: sb }; }).catch(function () {
-        return getJSON(U.schedule, 60).then(function (sc) { return { schedule: sc }; });
+      // ESPN scoreboard first; if it fails use Sleeper's schedule (no clock / red zone); only if both fail, the
+      // last scoreboard we had (and the status line goes amber/red either way).
+      var sbP = getJSON(U.scoreboard, 10, { src: "ESPN scores", critical: true, stale: false }).then(function (sb) { return { sb: sb }; }).catch(function (e1) {
+        return getJSON(U.schedule, 60, { src: "Sleeper schedule" }).then(function (sc) { return { schedule: sc }; })
+          .catch(function (e2) { var c = cache[U.scoreboard]; if (c) return { sb: c.v }; throw e1; });
       });
-      return Promise.all([sbP, getJSON(U.stats, 15), getJSON(U.projections, 1800), sleeperP, espnP])
+      return Promise.all([sbP, getJSON(U.stats, 15, { src: "Sleeper stats", critical: true }), getJSON(U.projections, 1800, { src: "Sleeper projections" }), sleeperP, espnP])
         .then(function (a) {
-          var raw = { season: season, week: week, scoreboard: a[0].sb || null, schedule: a[0].schedule, stats: a[1], projections: a[2], sleeper: a[3], espn: a[4], dk: dkData };
+          var raw = { season: season, week: week, seasonType: seasonType, scoreboard: a[0].sb || null, schedule: a[0].schedule, stats: a[1], projections: a[2], sleeper: a[3], espn: a[4], dk: dkData };
           if (DEMO) Object.assign(raw, makeDemo(raw));
           return SCC.buildState(raw);
         });
@@ -144,11 +195,17 @@
   }
 
   /* ---------------------------------------------------------------- refresh loop */
+  /* setTimeout chain instead of setInterval: polls at the user's rate while games are live, slows to every
+     minute / 5 minutes when nothing is live, backs off after failures, and pauses while the tab is hidden. */
+  function schedule(ms) { clearTimeout(timer); nextAt = Date.now() + ms; timer = setTimeout(tick, ms); }
   function tick() {
-    if (busy) return;
-    busy = true;
+    if (busy && Date.now() - tickStarted < 60000) return;
+    if (document.hidden && S) { paused = true; clearTimeout(timer); nextAt = 0; return; }
+    paused = false; busy = true; tickStarted = Date.now(); tickId++;
     lastErr = "";
     gather().then(function (st) {
+      Object.keys(health).forEach(function (k) { if (health[k].seen !== tickId) delete health[k]; });   // removed leagues
+      S0 = st; adoptWeek(st);
       var ev = SCC.diffEvents(prevInterest, st.interest, settings.minDelta);
       var now = Date.now();
       ev.forEach(function (e) {
@@ -158,35 +215,57 @@
       });
       if (ev.length && settings.sound) beep(ev.some(function (e) { return e.tone === "good"; }));
       feed = feed.slice(0, 80);
-      save(LS.feed, feed);
+      scopedSave(LS.feed, feed);
       prevInterest = st.interest;
-      if (!DEMO) save(LS.prev, st.interest);
-      S = st; lastOk = now;
-      render();
-    }).catch(function (e) { lastErr = e.message || String(e); render(); console.error(e); })
-      .then(function () { busy = false; });
+      scopedSave(LS.prev, st.interest);
+      S = st;
+      // full outage (every critical feed failing) backs off further each time; one failing feed only doubles the delay
+      var ds = SCC.dataStatus(health, Date.now(), settings.poll);
+      fails = ds.level === "offline" ? fails + 1 : ds.failing.length ? 1 : 0;
+    }).catch(function (e) { fails++; lastErr = e.message || String(e); console.error(e); })
+      .then(function () {
+        busy = false;
+        render();
+        schedule(SCC.pollDelay(S ? S.games : [], Date.now(), settings.poll, fails));
+      });
   }
   function start() {
-    clearInterval(timer);
     tick();
-    timer = setInterval(tick, Math.max(10, settings.poll || 15) * 1000);
-    setInterval(function () { var c = document.getElementById("clock"); if (c) c.textContent = clockStr(); renderStatus(); }, 1000);
+    if (!clockTimer) clockTimer = setInterval(function () { var c = document.getElementById("clock"); if (c) c.textContent = clockStr(); renderStatus(); }, 1000);
   }
+  document.addEventListener("visibilitychange", function () { if (!document.hidden && paused) tick(); });
 
   /* ---------------------------------------------------------------- render */
   function clockStr() { return new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }); }
+  var stripTable = false;
   function sizeRoot() {
     var w = innerWidth, h = innerHeight, z = settings.zoom || 1, fs, D = display();
     document.body.setAttribute("data-density", D.density);
     if (VIEW === "rail") fs = Math.min(w / D.rail, h / 70);
-    else if (VIEW === "strip") { var n = S && S.dk.lineups.length ? Math.min(S.dk.lineups.length, 10) : 8; fs = Math.min(w / (n * D.strip + 19), h / 24); }
+    else if (VIEW === "strip") {
+      /* Side-by-side lineup cards need ~24 lines of height. In a short strip (the 1080p zone is 1440×270) that
+         makes the player rows ~8 px, so below ~12 px the strip switches to one line per lineup instead. */
+      var n = S && S.dk.lineups.length ? Math.min(S.dk.lineups.length, 10) : 8;
+      fs = Math.min(w / (n * D.strip + 19), h / 24);
+      stripTable = fs * z * 0.74 < 12 || (S && S.dk.lineups.length > 12);
+      if (stripTable) { var rows = S && S.dk.lineups.length ? Math.min(S.dk.lineups.length, 12) : 8; fs = Math.min(h / (rows * 1.45 + 4.5), w / 62); }
+    }
     else fs = Math.min(w / D.all, h / 58);
     document.documentElement.style.fontSize = Math.max(9, fs * z) + "px";
   }
+  function ageStr(sec) { return sec < 90 ? sec + "s" : sec < 5400 ? Math.round(sec / 60) + " min" : Math.round(sec / 3600) + " h"; }
   function statusHTML() {
-    var age = lastOk ? Math.round((Date.now() - lastOk) / 1000) : null;
-    var cls = lastErr ? "err" : age == null || age > 60 ? "stale" : "";
-    return '<span class="dot ' + cls + '"></span>' + (age == null ? "connecting…" : "updated " + age + "s ago") + (lastErr ? ' · <span class="err">' + esc(lastErr) + "</span>" : "");
+    var now = Date.now(), ds = SCC.dataStatus(health, now, settings.poll);
+    var level = lastErr && ds.level === "ok" ? "stale" : ds.level;
+    var cls = { ok: "", connecting: "idle", stale: "stale", offline: "err" }[level];
+    var txt = level === "connecting" ? "connecting…" : ds.age == null ? "no data yet" :
+      level === "ok" ? "updated " + ageStr(ds.age) + " ago" : (level === "offline" ? "OFFLINE · " : "") + "data " + ageStr(ds.age) + " old";
+    var next = nextAt && !busy ? Math.max(0, Math.round((nextAt - now) / 1000)) : null;
+    var fail = ds.failing.map(function (k) { return k + " (" + health[k].err + ")"; });
+    return '<span class="dot ' + cls + '" title="' + esc(level) + '"></span><span class="st-' + level + '">' + esc(txt) + "</span>" +
+      (fail.length ? ' · <span class="' + (level === "offline" ? "err" : "warnline") + '">failing: ' + esc(fail.join(", ")) + "</span>" : "") +
+      (lastErr ? ' · <span class="err">' + esc(lastErr) + "</span>" : "") +
+      (paused ? ' · <span class="warnline">paused (tab hidden)</span>' : next != null && next > 45 ? ' · <span style="color:var(--dim)">next refresh ' + ageStr(next) + (fails ? " (retrying slower)" : " (no games live)") + "</span>" : "");
   }
   function renderStatus() { var s = document.getElementById("status"); if (s) s.innerHTML = statusHTML(); }
 
@@ -198,31 +277,20 @@
     }).join(" ");
     return '<div class="panel hdr"><div class="clock num" id="clock">' + clockStr() + '</div>' +
       '<div class="meta"><b>Week ' + esc(S ? S.week : "–") + "</b> · " + live + " live · " + pre + " to go · " + done + " final" +
+      (S && S.seasonType === "post" ? ' · <span class="warnline" title="Built and tested for the regular season">postseason (experimental)</span>' : "") +
       (S && S.scoreSource !== "espn" ? ' · <span class="warnline" title="ESPN scoreboard unreachable; using Sleeper schedule">scores: fallback (no clock / red zone)</span>' : "") +
       (DEMO ? ' · <b style="color:var(--warn)">DEMO DATA</b>' : settings.displayName ? " · " + esc(settings.displayName) : "") +
       '<br><span id="status">' + statusHTML() + "</span></div><div class='sp'></div>" +
       (VIEW === "rail" ? "" : views + " ") +
-      (settings.redzoneUrl ? '<a class="btn" target="redzone" href="' + esc(settings.redzoneUrl) + '">RedZone ↗</a> ' : "") +
+      (SCC.safeUrl(settings.redzoneUrl) ? '<a class="btn" target="redzone" rel="noopener" href="' + esc(SCC.safeUrl(settings.redzoneUrl)) + '">RedZone ↗</a> ' : "") +
       '<button class="btn" data-act="settings">⚙</button> <button class="btn" data-act="help">?</button></div>';
   }
   function params(o) { var p = new URLSearchParams(location.search); Object.keys(o).forEach(function (k) { p.set(k, o[k]); }); return p.toString(); }
 
   function radar() {
-    var rz = S.games.filter(function (g) { return g.rz; });
-    var rows = rz.map(function (g) {
-      var mine = [], opp = [];
-      Object.keys(S.interest).forEach(function (pid) {
-        var x = S.interest[pid];
-        if (x.team !== g.poss) return;
-        if (x.mine.length || x.dk) mine.push(last(x.name) + (x.dk ? '<sup class="tag dk">DK' + x.dk + "</sup>" : ""));
-        if (x.opp.length) opp.push(last(x.name));
-      });
-      return '<div class="row" data-game="' + g.id + '"><div class="g">' + esc(g.poss) + ' <span style="color:var(--dim)">' + esc(g.dd) + "</span></div>" +
-        '<div class="who">' + (mine.length ? '<span style="color:var(--good)">▲ ' + mine.join(", ") + "</span> " : "") +
-        (opp.length ? '<span style="color:var(--bad)">▼ ' + esc(opp.join(", ")) + "</span>" : "") + (!mine.length && !opp.length ? '<span style="color:var(--dim)">none of your guys on offense</span>' : "") + "</div></div>";
-    });
-    return '<div class="panel"><h2>RedZone radar <span>' + rz.length + " in the red zone</span></h2><div class='radar'>" +
-      (rows.join("") || '<div class="none">No team inside the 20 right now.</div>') + "</div></div>";
+    var r = SCC.radarHTML(S.games, S.interest);   // all names escaped in core.js (tested)
+    return '<div class="panel"><h2>RedZone radar <span>' + r.count + " in the red zone</span></h2><div class='radar'>" +
+      (r.html || '<div class="none">No team inside the 20 right now.</div>') + "</div></div>";
   }
 
   function games() {
@@ -230,13 +298,13 @@
     var gs = S.games.slice().sort(function (a, b) { return order[a.state] - order[b.state] || (b.rz - a.rz) || a.kick.localeCompare(b.kick); });
     return '<div class="panel"><h2>Games <span>click to spotlight · Esc clears</span></h2><div class="games">' + gs.map(function (g) {
       var t = function (tm, sc, other) {
-        return '<div class="t ' + (g.state !== "pre" ? (sc > other ? "lead" : sc < other ? "trail" : "") : "") + '"><span class="' + (g.poss === tm ? "pos" : "") + '">' + esc(tm) + '</span><span class="num">' + (g.state === "pre" ? "" : sc) + "</span></div>";
+        return '<div class="t ' + (g.state !== "pre" ? (sc > other ? "lead" : sc < other ? "trail" : "") : "") + '"><span class="' + (g.poss === tm ? "pos" : "") + '">' + esc(tm) + '</span><span class="num">' + (g.state === "pre" ? "" : esc(sc)) + "</span></div>";
       };
       var kick = g.state === "pre" ? new Date(g.kick).toLocaleTimeString([], { weekday: "short", hour: "numeric", minute: "2-digit" }) : g.detail;
-      return '<div class="game ' + g.state + (g.rz ? " rz" : "") + (focus === g.id ? " focus" : "") + '" data-game="' + g.id + '" title="' + esc(g.last) + '">' +
+      return '<div class="game ' + esc(g.state) + (g.rz ? " rz" : "") + (focus === g.id ? " focus" : "") + '" data-game="' + esc(g.id) + '" title="' + esc(g.last) + '">' +
         t(g.away, g.as, g.hs) + t(g.home, g.hs, g.as) + '<div class="s"><span>' + esc(kick) + (g.state === "in" && g.dd ? " · " + esc(g.dd) : "") + '</span><span class="tags">' +
-        (g.rz ? '<span class="tag rz">RZ</span>' : "") + (g.mine ? '<span class="tag me" title="your Sleeper starters">' + g.mine + "</span>" : "") +
-        (g.against ? '<span class="tag op" title="opponents\' starters">' + g.against + "</span>" : "") + (g.dk ? '<span class="tag dk" title="DK lineup slots">' + g.dk + "</span>" : "") +
+        (g.rz ? '<span class="tag rz">RZ</span>' : "") + (g.mine ? '<span class="tag me" title="your Sleeper starters">' + (+g.mine) + "</span>" : "") +
+        (g.against ? '<span class="tag op" title="opponents\' starters">' + (+g.against) + "</span>" : "") + (g.dk ? '<span class="tag dk" title="DK lineup slots">' + (+g.dk) + "</span>" : "") +
         "</span></div></div>";
     }).join("") + "</div></div>";
   }
@@ -245,7 +313,7 @@
     var cls = ["chip", r.status, r.rz && r.status === "in" ? "rz" : "", r.poss ? "ball" : "", hot[r.id] && Date.now() - hot[r.id] < 90000 ? "hot" : "",
       focus && r.game === focus ? "focus" : "", (r.inj === "Out" || r.inj === "IR") ? "inj" : ""].join(" ");
     var tip = r.name + " · " + (r.team || "") + " · proj " + f1(r.proj) + (r.inj ? " · " + r.inj : "");
-    return '<span class="' + cls + '" title="' + esc(tip) + '"><span class="p">' + esc(r.pos) + "</span>" + esc(last(r.name)) + '<b class="num">' + f1(r.pts) + "</b></span>";
+    return '<span class="' + esc(cls) + '" title="' + esc(tip) + '"><span class="p">' + esc(r.pos) + "</span>" + esc(last(r.name)) + '<b class="num">' + f1(r.pts) + "</b></span>";
   }
 
   function sleeperPanel() {
@@ -260,13 +328,13 @@
       var me = m.me, op = m.opp || { name: "Bye", pts: 0, live: 0, starters: [], yet: 0, playing: 0, record: "" };
       var wp = m.winProb == null ? null : Math.round(m.winProb * 100);
       var share = me.live + op.live > 0 ? 100 * me.live / (me.live + op.live) : 50;
-      return '<div class="mu"><div class="top"><span class="plat ' + m.platform + '">' + (m.platform === "espn" ? "ESPN" : "SLPR") + '</span><span class="lg">' + esc(m.league) + "</span>" +
+      return '<div class="mu"><div class="top"><span class="plat ' + esc(m.platform) + '">' + (m.platform === "espn" ? "ESPN" : "SLPR") + '</span><span class="lg">' + esc(m.league) + "</span>" +
         (m.me.espnProj != null ? '<span class="wp" style="color:var(--dim)" title="ESPN live projection">ESPN proj ' + f1(m.me.espnProj) + "</span>" : "") +
         (wp == null ? "" : '<span class="wp" style="color:' + (wp >= 50 ? "var(--good)" : "var(--bad)") + '">' + wp + "% win</span>") + "</div>" +
         '<div class="score"><span class="nm">' + esc(me.name) + ' <small style="color:var(--dim)">' + esc(me.record) + '</small></span><span class="pts num ' + (me.pts >= op.pts ? "win" : "lose") + '">' + f2(me.pts) +
         '</span><span class="pts num">' + f2(op.pts) + '</span><span class="nm r">' + esc(op.name) + "</span></div>" +
         '<div class="bar"><i style="width:' + share.toFixed(1) + '%"></i></div>' +
-        '<div class="sub num"><span>proj ' + f1(me.live) + " · " + me.playing + " live · " + me.yet + " to go" + (me.empty ? ' · <b style="color:var(--bad)">' + me.empty + " EMPTY</b>" : "") +
+        '<div class="sub num"><span>proj ' + f1(me.live) + " · " + me.playing + " live · " + me.yet + " to go" + (me.empty ? ' · <b style="color:var(--bad)">' + (+me.empty) + " EMPTY</b>" : "") +
         '</span><span class="r">' + op.yet + " to go · " + op.playing + " live · proj " + f1(op.live) + "</span></div>" +
         '<div class="chips">' + me.starters.map(chip).join("") + '</div><div class="chips opp">' + op.starters.map(chip).join("") + "</div></div>";
     }).join("") + "</div></div>";
@@ -275,10 +343,10 @@
   function feedPanel(limit) {
     var rows = feed.slice(0, limit || 40).map(function (e) {
       var who = [];
-      if (e.mine.length) who.push("yours: " + e.mine.length);
+      if ((e.mine || []).length) who.push("yours: " + e.mine.length);
       if (e.dk) who.push("DK×" + e.dk);
-      if (e.opp.length) who.push("vs you: " + e.opp.length);
-      return '<div class="ev ' + e.tone + (e.td ? " td" : "") + '" title="' + esc(e.mine.concat(e.opp.map(function (x) { return "vs: " + x; })).join("\n")) + '"><span class="tm num">' +
+      if ((e.opp || []).length) who.push("vs you: " + e.opp.length);
+      return '<div class="ev ' + esc(e.tone) + (e.td ? " td" : "") + '" title="' + esc((e.mine || []).concat((e.opp || []).map(function (x) { return "vs: " + x; })).join("\n")) + '"><span class="tm num">' +
         new Date(e.t).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) + "</span><span>" + (e.td ? "🏈 TD " : "") + esc(e.name) + " " +
         '<b class="num">' + (e.delta >= 0 ? "+" : "") + f1(e.delta) + "</b> <span style='color:var(--dim)'>" + esc(who.join(" · ")) + "</span></span></div>";
     });
@@ -289,38 +357,47 @@
   function dkPanel() {
     var dk = S.dk;
     if (!dk.lineups.length) {
-      return '<div class="panel" style="flex:1"><h2>DraftKings</h2><div style="color:var(--dim)">No lineups imported. Open <button class="btn" data-act="settings">⚙ Settings</button> and drop in your DK entries CSV (My Contests → Upcoming/Live → Export to CSV) or your upload CSV.</div></div>';
+      return '<div class="panel" style="flex:1"><h2>DraftKings</h2><div style="color:var(--dim)">No lineups imported. Open <button class="btn" data-act="settings">⚙ Settings</button> and drop in your DraftKings entries file (DKEntries.csv: on the DK website, Lineups → Edit Entries → pick the slate → Download) or your upload CSV.</div></div>';
     }
     var best = dk.lineups.reduce(function (a, b) { return b.pts > a.pts ? b : a; });
     var ranked = dk.lineups.slice().sort(function (a, b) { return b.pts - a.pts; });
     var fees = dk.contests.reduce(function (a, c) { return a + c.fees; }, 0);
     var hdr = '<div class="dkhdr"><span class="big num">' + f2(best.pts) + '</span><span>best of ' + dk.lineups.length + " (#" + best.n + ")</span>" +
       "<span>avg " + f1(dk.lineups.reduce(function (a, l) { return a + l.pts; }, 0) / dk.lineups.length) + "</span>" +
-      dk.contests.map(function (c) { return "<span>" + esc(c.name) + " · " + c.entries + " entries" + (c.fees ? " · $" + c.fees : "") + "</span>"; }).join("") +
-      '<a target="dkmc" href="https://www.draftkings.com/mycontests">DK My Contests ↗</a>' +
-      (dk.unmatched.length ? '<span class="warnline">unmatched: ' + esc(dk.unmatched.join(", ")) + "</span>" : "") + "</div>";
-    var many = dk.lineups.length > 12;
+      dk.contests.map(function (c) { return "<span>" + esc(c.name) + " · " + (+c.entries) + " entries" + (c.fees ? " · $" + esc(c.fees) : "") + "</span>"; }).join("") +
+      '<a target="dkmc" rel="noopener" href="https://www.draftkings.com/mycontests">DK My Contests ↗</a>' +
+      (VIEW === "strip" ? '<span id="status">' + statusHTML() + '</span><button class="btn" data-act="settings">⚙</button>' : "") +
+      (dk.unmatched.length ? '<span class="warnline">unmatched: ' + esc(dk.unmatched.join(", ")) + "</span>" : "") +
+      (dk.incomplete.length ? '<span class="warnline" title="These slots could not be read from the file, so the totals are too low. Re-export the file or paste the lineup.">⚠ incomplete: ' +
+        esc(dk.incomplete.map(function (x) { return "#" + x.n + " missing " + x.slots.join("/"); }).join(" · ")) + "</span>" : "") +
+      (dk.lineups.some(function (l) { return l.showdown; }) ? '<span class="warnline">Showdown: captain ×1.5, kickers not scored</span>' : "") + "</div>";
+    var many = dk.lineups.length > 12 || (VIEW === "strip" && stripTable);
     var cols = VIEW === "all" ? Math.min(4, dk.lineups.length) : Math.min(dk.lineups.length, 10);
     var lus = many ? compactLineups(ranked) : '<div class="lus" style="grid-template-columns:repeat(' + cols + ',minmax(0,1fr))">' + dk.lineups.map(function (lu) {
-      return '<div class="lu' + (lu === best ? " best" : "") + '"><div class="h"><span class="n">#' + lu.n + " · rank " + (ranked.indexOf(lu) + 1) + '</span><span class="pts num">' + f2(lu.pts) + "</span></div>" +
+      return '<div class="lu' + (lu === best ? " best" : "") + '"><div class="h"><span class="n">#' + lu.n + " · rank " + (ranked.indexOf(lu) + 1) +
+        (lu.missing.length ? ' <b class="warnline" title="' + esc("not read from the file: " + lu.missing.map(function (x) { return x.slot + (x.cell ? " " + x.cell : ""); }).join(", ")) + '">⚠ ' + lu.missing.length + " missing</b>" : "") +
+        '</span><span class="pts num">' + f2(lu.pts) + "</span></div>" +
         '<div class="h2 num"><span>proj ' + f1(lu.live) + "</span><span>" + lu.playing + " live · " + lu.yet + " to go</span></div>" +
         lu.players.map(function (p) {
           var cls = ["pl", p.status, p.rz && p.status === "in" ? "rz" : "", focus && S.games.some(function (g) { return g.id === focus && (g.home === p.team || g.away === p.team); }) ? "focus" : "",
             p.sid && hot[p.sid] && Date.now() - hot[p.sid] < 90000 ? "hot" : ""].join(" ");
-          return '<div class="' + cls + '" title="' + esc(p.name + " · " + (p.team || "?") + " · proj " + f1(p.proj) + (p.sal ? " · $" + p.sal : "") + (p.matched ? "" : " · NOT MATCHED")) + '"><span class="sl">' + esc(p.slot) +
+          return '<div class="' + esc(cls) + '" title="' + esc(p.name + " · " + (p.team || "?") + " · proj " + f1(p.proj) + (p.sal ? " · $" + p.sal : "") + (p.matched ? "" : " · NOT MATCHED")) + '"><span class="sl">' + esc(p.slot) +
             '</span><span class="nm">' + esc(short(p.name)) + (p.poss ? " 🏈" : "") + '</span><span class="num">' + f1(p.pts) + "</span></div>";
         }).join("") + "</div>";
     }).join("") + "</div>";
     var expo = '<div class="expo panel scroll"><h2>Exposure</h2><table class="num"><tr><th>Player</th><th class="r">Lineups</th><th class="r">DK pts</th></tr>' +
       dk.exposure.map(function (e) {
-        return '<tr class="' + e.status + (e.rz && e.status === "in" ? " rz" : "") + '"><td>' + esc(short(e.name)) + ' <small style="color:var(--dim)">' + esc(e.team || "") + '</small></td><td class="r">' + e.count + " (" + e.pct + '%)</td><td class="r">' + f1(e.pts) + "</td></tr>";
+        return '<tr class="' + esc(e.status) + (e.rz && e.status === "in" ? " rz" : "") + '"><td>' + esc(short(e.name)) + ' <small style="color:var(--dim)">' + esc(e.team || "") + '</small></td><td class="r">' + (+e.count) + " (" + (+e.pct) + '%)</td><td class="r">' + f1(e.pts) + "</td></tr>";
       }).join("") + "</table></div>";
     return '<div class="panel" style="flex:1;min-height:0"><h2>DraftKings <span>live DK scoring, calculated from Sleeper stats</span></h2>' + hdr + '<div class="dkwrap"><div class="scroll">' + lus + "</div>" + expo + "</div></div>";
   }
   function compactLineups(ranked) {
-    return '<table class="num" style="width:100%;font-size:.75em">' + ranked.map(function (lu, i) {
-      return "<tr><td>" + (i + 1) + ".</td><td>#" + lu.n + "</td><td><b>" + f2(lu.pts) + "</b></td><td>proj " + f1(lu.live) + "</td><td>" + lu.yet + " to go</td><td style='color:var(--dim)'>" +
-        esc(lu.players.map(function (p) { return last(p.name); }).join(", ")) + "</td></tr>";
+    return '<table class="num lutable" style="width:100%;font-size:' + (VIEW === "strip" ? ".85em" : ".75em") + '">' + ranked.map(function (lu, i) {
+      return "<tr" + (i === 0 ? ' class="best"' : "") + "><td>" + (i + 1) + ".</td><td>#" + lu.n + "</td><td><b>" + f2(lu.pts) + "</b></td><td>proj " + f1(lu.live) + "</td><td>" + lu.playing + " live · " + lu.yet + " to go" +
+        (lu.missing.length ? ' <b class="warnline">⚠ ' + lu.missing.length + " missing</b>" : "") + "</td><td class='who'>" +
+        lu.players.map(function (p) {
+          return '<span class="' + esc(p.status + (p.rz && p.status === "in" ? " rz" : "")) + '">' + esc(last(p.name)) + "</span>";
+        }).join(", ") + "</td></tr>";
     }).join("") + "</table>";
   }
 
@@ -372,11 +449,11 @@
       '<div class="rowf"><input id="eid" placeholder="ESPN league ID (from the league URL: leagueId=…)" style="width:22em"><input id="eseason" type="number" style="width:6em" value="' + esc(currentSeason()) + '"><button class="btn" data-act="espnload">Load teams</button></div>' +
       '<div class="rowf" id="eteams"></div>' +
       '<details><summary class="hint">Private ESPN league? (espn_s2 / SWID)</summary>' +
-      '<p class="hint">Public leagues just work. For private leagues the page first tries your browser\'s own ESPN login. If that\'s blocked, run the tiny local proxy (<code>proxy/start-proxy.bat</code> or <code>.sh</code>) and paste your cookies here (see README). They\'re kept in this browser and only ever sent to the proxy on <code>localhost</code>.</p>' +
+      '<p class="hint">Public leagues just work. For private leagues the page first tries your browser\'s own ESPN login. If that\'s blocked, run the tiny local proxy (<code>proxy/start-proxy.bat</code> or <code>.sh</code>). <b>Safest:</b> put your cookies in <code>proxy/config.json</code> on your computer and leave these boxes empty. If you paste them here instead, they\'re saved in this browser\'s storage for this site and sent only to a proxy at <code>localhost</code>/<code>127.0.0.1</code> (other Proxy addresses are refused).</p>' +
       '<div class="rowf"><input id="es2" type="password" placeholder="espn_s2" value="' + esc(settings.espnS2) + '" style="width:18em"><input id="eswid" type="password" placeholder="SWID {…}" value="' + esc(settings.espnSwid) + '" style="width:16em"></div>' +
       '<div class="rowf"><label>Proxy <input id="eproxy" value="' + esc(settings.proxyUrl) + '" style="width:14em"></label><button class="btn" data-act="proxytest">Test proxy</button><span id="proxymsg" class="hint"></span></div></details>' +
       "<h3>2 · DraftKings lineups</h3>" +
-      '<p class="hint">Drop or pick any of: your <b>entries export</b> (DK → My Contests → Upcoming → Export to CSV, best: includes contests &amp; teams), the <b>upload CSV</b> you edit for DK bulk upload, and optionally <b>DKSalaries.csv</b> from the lobby. Or paste lineups, one per line: <code>Name (ID), Name (ID), …</code></p>' +
+      '<p class="hint">Drop or pick any of: your <b>entries file</b> <code>DKEntries.csv</code> (best: includes contests &amp; teams; on the DK website: Lineups → Edit Entries → pick the slate → Download; DK may rename menus), the <b>upload CSV</b> you edit for DK bulk upload, and optionally <b>DKSalaries.csv</b> from the contest lobby. Or paste lineups, one per line: <code>Name (ID), Name (ID), …</code> Tags like <code>(LOCKED)</code> are ignored; any slot that can\'t be read is listed as a warning.</p>' +
       '<div class="drop" id="drop">Drop CSV files here or <label class="btn">browse<input type="file" id="files" accept=".csv,text/csv,text/plain" multiple hidden></label></div>' +
       '<textarea id="paste" rows="4" placeholder="…or paste CSV / lineups here"></textarea>' +
       '<div class="rowf"><button class="btn" data-act="importpaste">Import pasted</button><label><input type="checkbox" id="replace" checked> replace existing lineups</label><button class="btn" data-act="cleardk">Clear DK data</button></div>' +
@@ -386,8 +463,8 @@
       '<div class="rowf"><label>Display size <select id="display">' + ["auto"].concat(Object.keys(DISPLAYS)).map(function (k) {
         return '<option value="' + k + '"' + ((settings.display || "auto") === k ? " selected" : "") + ">" + (k === "auto" ? "Auto (detected: " + DISPLAYS[detectDisplay()].label + ")" : DISPLAYS[k].label) + "</option>";
       }).join("") + "</select></label></div>" +
-      '<div class="rowf"><label>Zoom <input id="zoom" type="number" step="0.05" min="0.5" max="2" value="' + (settings.zoom || 1) + '" style="width:5em"></label>' +
-      '<label>Refresh every <input id="poll" type="number" min="10" max="120" value="' + (settings.poll || 15) + '" style="width:4em"> s</label>' +
+      '<div class="rowf"><label>Zoom <input id="zoom" type="number" step="0.05" min="0.5" max="2" value="' + esc(settings.zoom || 1) + '" style="width:5em"></label>' +
+      '<label>Refresh every <input id="poll" type="number" min="10" max="120" value="' + esc(settings.poll || 15) + '" style="width:4em"> s while games are live</label>' +
       '<label><input type="checkbox" id="sound"' + (settings.sound ? " checked" : "") + "> sound on scoring</label></div>" +
       '<div class="rowf"><button class="btn" data-act="launch">Open layout windows (RedZone + rail + strip)</button><a class="btn" href="?' + params({ view: "rail" }) + '" target="scc-rail">rail ↗</a><a class="btn" href="?' + params({ view: "strip" }) + '" target="scc-strip">strip ↗</a><a class="btn" href="?demo=1">demo ↗</a></div>' +
       '<p class="hint">For a pixel-perfect 4K layout use FancyZones (Windows) or Rectangle (Mac) — see the README.</p>' +
@@ -413,7 +490,7 @@
   }
   var espnPending = null;
   function espnLoad() {
-    var id = modal.querySelector("#eid").value.replace(/.*leagueId=/, "").replace(/\D.*$/, ""), season = modal.querySelector("#eseason").value || currentSeason();
+    var id = modal.querySelector("#eid").value.trim().replace(/.*leagueId=/, "").replace(/\D.*$/, ""), season = modal.querySelector("#eseason").value || currentSeason();
     var out = modal.querySelector("#eteams");
     if (!id) { out.innerHTML = '<span class="err">Enter a league ID.</span>'; return; }
     readEspnCreds();
@@ -422,7 +499,7 @@
       var teams = SCC.espnTeams(d);
       espnPending = { leagueId: id, season: String(season), leagueName: (d.settings || {}).name || ("ESPN " + id) };
       out.innerHTML = "<b>" + esc(espnPending.leagueName) + '</b> <select id="eteam">' + teams.map(function (t) {
-        return '<option value="' + t.id + '">' + esc(t.name) + (t.owner ? " — " + esc(t.owner) : "") + "</option>";
+        return '<option value="' + esc(t.id) + '">' + esc(t.name) + (t.owner ? " — " + esc(t.owner) : "") + "</option>";
       }).join("") + '</select> <button class="btn" data-act="espnadd">Add — this is my team</button>' +
         (espnMode[id + ":" + season] && espnMode[id + ":" + season] !== "direct" ? ' <span class="hint">(private, via ' + espnMode[id + ":" + season] + ")</span>" : "");
     }).catch(function (e) { out.innerHTML = '<span class="err">' + esc(e.message) + "</span>"; });
@@ -447,7 +524,8 @@
     readEspnCreds();
     var msg = modal.querySelector("#proxymsg");
     msg.textContent = "checking…";
-    fetch(settings.proxyUrl.replace(/\/$/, "") + "/health").then(function (r) { return r.json(); }).then(function (h) {
+    if (!isLoopback(settings.proxyUrl)) { msg.innerHTML = '<span class="err">Proxy must be http://localhost:&lt;port&gt; or http://127.0.0.1:&lt;port&gt;</span>'; return; }
+    fetchT(settings.proxyUrl.replace(/\/$/, "") + "/health").then(function (r) { return r.json(); }).then(function (h) {
       msg.innerHTML = h.ok ? '<span style="color:var(--good)">proxy OK</span>' + (h.cookiesInConfig ? " · cookies in config.json" : settings.espnS2 ? " · using cookies from this page" : ' · <span class="err">no cookies yet</span>') : "unexpected reply";
     }).catch(function () { msg.innerHTML = '<span class="err">no proxy at ' + esc(settings.proxyUrl) + "</span>"; });
   }
@@ -456,8 +534,8 @@
     return "<b>" + dkData.lineups.length + " lineups</b>, " + Object.keys(dkData.salaries || {}).length + " players with salary/team info" +
       (dkData.files.length ? " · from " + esc(dkData.files.join(", ")) : "") + (dkData.importedAt ? " · " + new Date(dkData.importedAt).toLocaleString() : "");
   }
-  function importText(text, name, replaceFirst) {
-    var r = SCC.parseDK(text);
+  function importText(text, name, replaceFirst, parsed) {
+    var r = parsed || SCC.parseDK(text);
     if (replaceFirst) dkData = { lineups: [], salaries: {}, files: [], importedAt: null };
     dkData.lineups = dkData.lineups.concat(r.lineups);
     Object.assign(dkData.salaries, r.salaries);
@@ -470,16 +548,19 @@
     Promise.all(files.map(function (f) { return f.text().then(function (t) { return { f: f, t: t, r: SCC.parseDK(t) }; }); })).then(function (arr) {
       var hasLineups = arr.some(function (x) { return x.r.lineups.length; });
       if (replace && hasLineups) dkData = { lineups: [], salaries: {}, files: [], importedAt: null };
+      var warns = [];
       arr.forEach(function (x) {
-        importText(x.t, x.f.name, false);
+        importText(x.t, x.f.name, false, x.r);
         msgs.push(x.f.name + ": " + x.r.lineups.length + " lineups, " + Object.keys(x.r.salaries).length + " salaries");
+        (x.r.warnings || []).forEach(function (w) { warns.push(x.f.name + " · " + w); });
       });
-      finishImport(msgs);
+      finishImport(msgs, warns);
     });
   }
-  function finishImport(msgs) {
+  function finishImport(msgs, warns) {
     save(LS.dk, dkData);
-    modal.querySelector("#dkmsg").innerHTML = esc(msgs.join(" · ")) + "<br>" + dkSummary();
+    modal.querySelector("#dkmsg").innerHTML = esc(msgs.join(" · ")) + "<br>" + dkSummary() +
+      ((warns || []).length ? '<div class="warnline" style="font-size:1em;margin-top:.3em">⚠ ' + warns.map(esc).join("<br>⚠ ") + "</div>" : "");
     cache = {}; tick();
   }
 
@@ -503,7 +584,7 @@
       if (!box) return;
       box.innerHTML = ls.length ? ls.map(function (l) {
         return '<label class="lgopt"><input type="checkbox" data-lid="' + esc(l.league_id) + '"' + (settings.hidden.indexOf(l.league_id) < 0 ? " checked" : "") + "> " +
-          esc(l.name) + ' <small style="color:var(--dim)">' + esc(l.status) + " · " + l.total_rosters + " teams</small></label>";
+          esc(l.name) + ' <small style="color:var(--dim)">' + esc(l.status) + " · " + esc(l.total_rosters) + " teams</small></label>";
       }).join("") : '<span class="hint">No leagues found for this season.</span>';
       box.querySelectorAll("input").forEach(function (cb) {
         cb.addEventListener("change", function () {
@@ -524,8 +605,8 @@
       window.open(base + params({ view: "rail" }), "scc-rail", spec(w2, 0, W - w2, H)),
       window.open(base + params({ view: "strip" }), "scc-strip", spec(0, h2, w2, H - h2))
     ];
-    if (settings.redzoneUrl) opened.push(window.open(settings.redzoneUrl, "redzone", spec(0, 0, w2, h2)));
-    if (opened.some(function (w) { return !w; })) alert("Your browser blocked some pop-up windows. Allow pop-ups for this page and click again.");
+    if (SCC.safeUrl(settings.redzoneUrl)) opened.push(window.open(SCC.safeUrl(settings.redzoneUrl), "redzone", spec(0, 0, w2, h2)));
+    if (opened.some(function (w) { return !w; }) && !(settings.redzoneUrl && !SCC.safeUrl(settings.redzoneUrl))) alert("Your browser blocked some pop-up windows. Allow pop-ups for this page and click again.");
   }
 
   document.addEventListener("click", function (e) {
@@ -540,8 +621,8 @@
       else if (act === "espnadd") espnAdd();
       else if (act === "espnremove") { settings.espn.splice(+a.getAttribute("data-i"), 1); save(LS.settings, settings); renderEspnList(); tick(); }
       else if (act === "proxytest") proxyTest();
-      else if (act === "clearfeed") { feed = []; save(LS.feed, feed); render(); }
-      else if (act === "importpaste") { var t = modal.querySelector("#paste").value; if (t.trim()) { var r = importText(t, "pasted", modal.querySelector("#replace").checked); finishImport(["pasted: " + r.lineups.length + " lineups, " + Object.keys(r.salaries).length + " salaries"]); } }
+      else if (act === "clearfeed") { feed = []; scopedSave(LS.feed, feed); render(); }
+      else if (act === "importpaste") { var t = modal.querySelector("#paste").value; if (t.trim()) { var r = importText(t, "pasted", modal.querySelector("#replace").checked); finishImport(["pasted: " + r.lineups.length + " lineups, " + Object.keys(r.salaries).length + " salaries"], r.warnings); } }
       else if (act === "cleardk") { dkData = { lineups: [], salaries: {}, files: [], importedAt: null }; finishImport(["cleared"]); }
       else if (act === "launch") { saveForm(); launchLayout(); }
       else if (act === "savesettings") { saveForm(); modal.remove(); modal = null; start(); }
@@ -552,7 +633,7 @@
   });
   function saveForm() {
     if (!modal) return;
-    settings.redzoneUrl = modal.querySelector("#rz").value.trim();
+    settings.redzoneUrl = SCC.safeUrl(modal.querySelector("#rz").value);   // http(s) links only
     settings.zoom = parseFloat(modal.querySelector("#zoom").value) || 1;
     settings.display = modal.querySelector("#display").value || "auto";
     readEspnCreds();
@@ -562,7 +643,7 @@
     render();
   }
   document.addEventListener("keydown", function (e) {
-    if (/INPUT|TEXTAREA/.test(e.target.tagName)) return;
+    if (/INPUT|TEXTAREA|SELECT/.test(e.target.tagName) || e.ctrlKey || e.metaKey || e.altKey) return;   // leave Ctrl+R, Cmd+S… alone
     if (e.key === "Escape") { if (modal) { modal.remove(); modal = null; } focus = null; document.querySelector(".help").classList.remove("on"); render(); }
     else if (e.key === "s") openSettings();
     else if (e.key === "m") { settings.sound = !settings.sound; save(LS.settings, settings); }
@@ -591,7 +672,9 @@
   help.className = "help";
   help.innerHTML = "<h2>Keys</h2><b>1–9</b> spotlight the Nth live game (your players in it get outlined) · <b>Esc</b> clear · <b>s</b> settings · <b>r</b> refresh now · <b>m</b> sound on/off · <b>+ / −</b> zoom · <b>?</b> this help" +
     "<h2 style='margin-top:1em'>Legend</h2><span class='tag me'>3</span> your Sleeper starters in a game · <span class='tag op'>2</span> opponents' starters · <span class='tag dk'>5</span> DK lineup slots · <span class='tag rz'>RZ</span> offense inside the 20 · 🏈 has the ball · gold ring = just scored" +
-    "<p style='margin-top:1em;color:var(--dim)'>DK points are calculated from Sleeper's live stats with DraftKings Classic scoring, so they can lag or differ slightly from DK's official numbers. Contest ranks and payouts live in DK My Contests.</p>";
+    "<h2 style='margin-top:1em'>Status dot</h2><span class='dot'></span>fresh · <span class='dot stale'></span>a feed is failing or data is getting old (shows its real age) · <span class='dot err'></span>offline: nothing fresh is arriving" +
+    "<p style='margin-top:1em;color:var(--dim)'>DK points are calculated from Sleeper's live stats with DraftKings Classic scoring, so they can lag or differ slightly from DK's official numbers. Contest ranks and payouts live in DK My Contests.</p>" +
+    "<p style='color:var(--dim)'>Not affiliated with the NFL, Sleeper, ESPN or DraftKings. Scores and stats come from public but undocumented feeds that can change or stop working without notice.</p>";
   document.body.appendChild(help);
 
   if (!DEMO && !settings.userId && !(settings.espn || []).length && !dkData.lineups.length) { render(); openSettings(); }

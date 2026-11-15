@@ -19,8 +19,11 @@
     commanders: "WAS" };
   var POSITIONS = ["QB", "RB", "WR", "TE", "K", "DEF"];
 
-  function urls(season, week) {
+  /* seasonType: "regular" (default) or "post"; sbWeek: only set when the week is overridden (?week=) so the
+   * ESPN scoreboard shows the same week as the stats. */
+  function urls(season, week, seasonType, sbWeek) {
     var pos = POSITIONS.map(function (p) { return "position[]=" + p; }).join("&");
+    var st = seasonType === "post" ? "post" : "regular";
     return {
       state: "https://api.sleeper.app/v1/state/nfl",
       user: function (u) { return "https://api.sleeper.app/v1/user/" + encodeURIComponent(u); },
@@ -28,10 +31,11 @@
       rosters: function (lid) { return "https://api.sleeper.app/v1/league/" + lid + "/rosters"; },
       users: function (lid) { return "https://api.sleeper.app/v1/league/" + lid + "/users"; },
       matchups: function (lid) { return "https://api.sleeper.app/v1/league/" + lid + "/matchups/" + week; },
-      stats: "https://api.sleeper.com/stats/nfl/" + season + "/" + week + "?season_type=regular&" + pos,
-      projections: "https://api.sleeper.com/projections/nfl/" + season + "/" + week + "?season_type=regular&" + pos,
-      scoreboard: "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
-      schedule: "https://api.sleeper.com/schedule/nfl/regular/" + season
+      stats: "https://api.sleeper.com/stats/nfl/" + season + "/" + week + "?season_type=" + st + "&" + pos,
+      projections: "https://api.sleeper.com/projections/nfl/" + season + "/" + week + "?season_type=" + st + "&" + pos,
+      scoreboard: "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard" +
+        (sbWeek ? "?seasontype=" + (st === "post" ? 3 : 2) + "&week=" + encodeURIComponent(sbWeek) + "&dates=" + encodeURIComponent(season) : ""),
+      schedule: "https://api.sleeper.com/schedule/nfl/" + st + "/" + season
     };
   }
 
@@ -40,15 +44,39 @@
       .replace(/\b(jr|sr|ii|iii|iv|v)\b/g, "").replace(/\s+/g, " ").trim();
   }
   function num(x) { var n = parseFloat(x); return isFinite(n) ? n : 0; }
+  /* HTML-escape anything that came from a user, a file or an API before it goes into innerHTML. */
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"'`]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;", "`": "&#96;" }[c];
+    });
+  }
+  /* Only http(s) links are allowed for user-entered URLs (blocks javascript:, data:, etc.). */
+  function safeUrl(u) {
+    u = String(u || "").trim();
+    return /^https?:\/\/[^\s"'<>`]+$/i.test(u) ? u : "";
+  }
 
   /* ------------------------------------------------------------ scoring */
-  function dkPoints(s, pos) {
+  /* DraftKings NFL Classic scoring.
+   * state = the team's game state ("pre" | "in" | "post" | "bye"), or "proj" for projections.
+   * DST points-allowed tiers only apply once the game is live or final: Sleeper omits pts_allow when it is 0,
+   * so a defense that hasn't played yet would otherwise get the 10-point shutout tier. With no state given,
+   * the tier applies only if the stats show the team has played (gp / pts_allow / pts_allow_0). */
+  function dstTierApplies(s, state) {
+    if (state === "in" || state === "post" || state === "proj") return true;
+    if (state === "pre" || state === "bye") return false;
+    return num(s.gp) > 0 || s.pts_allow != null || num(s.pts_allow_0) > 0;
+  }
+  function paTier(pa) {
+    return pa <= 0 ? 10 : pa <= 6 ? 7 : pa <= 13 ? 4 : pa <= 20 ? 1 : pa <= 27 ? 0 : pa <= 34 ? -1 : -4;
+  }
+  function dkPoints(s, pos, state) {
     s = s || {};
     var g = function (k) { return num(s[k]); };
     if (pos === "DEF" || pos === "DST") {
-      var pa = g("pts_allow");
-      var tier = pa === 0 ? 10 : pa <= 6 ? 7 : pa <= 13 ? 4 : pa <= 20 ? 1 : pa <= 27 ? 0 : pa <= 34 ? -1 : -4;
-      return round2(g("sack") + 2 * g("int") + 2 * g("fum_rec") + 6 * (g("def_td") + g("def_st_td")) +
+      var tier = dstTierApplies(s, state) ? paTier(g("pts_allow")) : 0;
+      // fum_rec = defensive recoveries; def_st_fum_rec = special-teams recoveries (Sleeper splits them, DK counts both)
+      return round2(g("sack") + 2 * g("int") + 2 * (g("fum_rec") + g("def_st_fum_rec")) + 6 * (g("def_td") + g("def_st_td")) +
         2 * g("safe") + 2 * g("blk_kick") + 2 * g("def_2pt") + tier);
     }
     var p = 0.04 * g("pass_yd") + 4 * g("pass_td") - g("pass_int") + 0.1 * g("rush_yd") + 6 * g("rush_td") +
@@ -91,15 +119,26 @@
     return rows;
   }
 
-  var NAMEID = /^\s*(.+?)\s*\((\d{5,})\)\s*$/;
+  /* "Name (12345678)" with optional extra tags in parentheses before or after the ID, e.g. DraftKings'
+   * "Name (12345678) (LOCKED)" for players whose game has started. Tags are stripped. */
+  var NAMEID = /^\s*(.+?)\s*(?:\((?!\d{5,}\))[^()]*\)\s*)*\((\d{5,})\)\s*(?:\([^()]*\)\s*)*$/;
   var SLOTS = ["QB", "RB", "WR", "TE", "FLEX", "DST", "CPT", "SUPERFLEX", "SFLEX", "K"];
+  var CLASSIC = ["QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DST"];
+  function parseCell(c) {
+    var m = NAMEID.exec(String(c || ""));
+    if (!m) return null;
+    var name = m[1].replace(/\s*\([^()]*\)\s*$/g, "").trim();
+    return name ? { name: name, dkId: m[2] } : null;
+  }
 
-  /* Accepts: DK upload template / edited upload CSV, the "Export to CSV" of your entries
-   * (Entry ID, Contest Name, Contest ID, Entry Fee, QB...DST + embedded salary table),
-   * DKSalaries.csv, or pasted text with one lineup per line ("Name (ID), Name (ID), ...").
-   * Returns {lineups:[...], salaries:{dkId:{...}}} */
+  /* Accepts: DKEntries.csv (Lineups -> Edit Entries -> Download: Entry ID, Contest Name, Contest ID, Entry Fee,
+   * QB...DST + embedded player table), the bulk upload template / edited upload CSV, DKSalaries.csv, or pasted
+   * text with one lineup per line ("Name (ID), Name (ID), ...").
+   * Never drops a lineup silently: a lineup with empty or unreadable slots is kept, and each problem is listed
+   * in lu.missing and in the returned warnings.
+   * Returns {lineups:[...], salaries:{dkId:{...}}, warnings:[string]} */
   function parseDK(text) {
-    var rows = parseCSV(text), sal = {}, lineups = [], hdr = null, salCol = -1, r, i;
+    var rows = parseCSV(text), sal = {}, lineups = [], hdr = null, salCol = -1, r, i, warnings = [];
     for (r = 0; r < rows.length; r++) {
       var row = rows[r];
       var k = row.indexOf("Name + ID");
@@ -110,31 +149,50 @@
           team: DK2SLP[t] || t, avg: num(row[salCol + 8]) };
       }
     }
+    var slotCols = [];
     for (r = 0; r < rows.length; r++) {
-      var rw = rows[r], lim = salCol > 0 ? salCol : rw.length;
-      if (!hdr && rw.slice(0, lim).some(function (c) { return SLOTS.indexOf(String(c).trim().toUpperCase()) >= 0; }) &&
-          !rw.slice(0, lim).some(function (c) { return NAMEID.test(c); })) { hdr = rw; continue; }
+      var rw = rows[r], lim = salCol >= 0 ? salCol : rw.length;   // DKSalaries.csv: salCol 0 -> no lineup columns
+      var isSlot = function (c) { return SLOTS.indexOf(String(c).trim().toUpperCase()) >= 0; };
+      if (!hdr && rw.slice(0, lim).some(isSlot) && !rw.slice(0, lim).some(function (c) { return !!parseCell(c); })) {
+        hdr = rw; slotCols = [];
+        for (i = 0; i < Math.min(hdr.length, lim); i++) if (isSlot(hdr[i])) slotCols.push(i);
+        continue;
+      }
       var cells = [];
-      for (i = 0; i < lim; i++) if (NAMEID.test(rw[i] || "")) cells.push(i);
-      if (cells.length < 6) continue;
-      var lu = { entry: "", contest: "", contestId: "", fee: 0, players: [] };
-      if (hdr) {
+      for (i = 0; i < lim; i++) if (parseCell(rw[i])) cells.push(i);
+      var lu = { entry: "", contest: "", contestId: "", fee: 0, players: [], missing: [] };
+      if (hdr && slotCols.length) {
         var get = function (name) { var j = hdr.indexOf(name); return j >= 0 ? (rw[j] || "") : ""; };
         lu.entry = get("Entry ID"); lu.contest = get("Contest Name"); lu.contestId = get("Contest ID");
         lu.fee = num(String(get("Entry Fee")).replace(/[$,]/g, ""));
+        var anySlotText = slotCols.some(function (ci) { return String(rw[ci] || "").trim(); });
+        // an entry row (has an Entry ID or anything in a slot column); skip the blank rows next to the player table
+        if (!cells.length && !(lu.entry && /\d/.test(lu.entry)) && !anySlotText) continue;
+        slotCols.forEach(function (ci) {
+          var slot = String(hdr[ci]).trim().toUpperCase(), p = parseCell(rw[ci]);
+          if (p) lu.players.push({ slot: slot, name: p.name, dkId: p.dkId });
+          else lu.missing.push({ slot: slot, cell: String(rw[ci] || "").trim().slice(0, 60) });
+        });
+        if (hdr.some(function (c) { return String(c).trim().toUpperCase() === "CPT"; })) lu.showdown = true;
+      } else {
+        if (!cells.length) continue;
+        if (cells.length < 6 && !/\(\d{5,}\)/.test(rw.join(" "))) continue;
+        cells.forEach(function (ci, j) { var p = parseCell(rw[ci]); lu.players.push({ slot: CLASSIC[j] || "", name: p.name, dkId: p.dkId }); });
+        for (i = lu.players.length; i < CLASSIC.length; i++) lu.missing.push({ slot: CLASSIC[i], cell: "" });
       }
-      cells.forEach(function (ci) {
-        var m = NAMEID.exec(rw[ci]);
-        var slot = hdr && hdr[ci] ? String(hdr[ci]).trim().toUpperCase() : "";
-        lu.players.push({ slot: slot, name: m[1], dkId: m[2] });
-      });
-      if (!hdr) { // pasted lines: classic slot order
-        var cls = ["QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DST"];
-        lu.players.forEach(function (p, j) { p.slot = cls[j] || ""; });
-      }
+      if (!lu.players.length && !lu.missing.length) continue;
+      lu.showdown = !!lu.showdown || lu.players.some(function (p) { return p.slot === "CPT"; });
       lineups.push(lu);
+      var label = "Lineup " + lineups.length + (lu.entry ? " (entry " + lu.entry + ")" : "");
+      if (lu.missing.length) {
+        warnings.push(label + ": " + lu.missing.length + " slot" + (lu.missing.length > 1 ? "s" : "") + " not read: " +
+          lu.missing.map(function (x) { return x.slot + (x.cell ? " \u201c" + x.cell + "\u201d" : " (empty)"); }).join(", "));
+      }
     }
-    return { lineups: lineups, salaries: sal };
+    if (lineups.some(function (l) { return l.showdown; })) {
+      warnings.push("Showdown lineups detected: scored with Classic rules and the 1.5\u00d7 captain multiplier; kickers score 0.");
+    }
+    return { lineups: lineups, salaries: sal, warnings: warnings };
   }
 
   /* ------------------------------------------------------------ ESPN */
@@ -362,15 +420,23 @@
     var lineups = (dk.lineups || []).map(function (lu, n) {
       var players = lu.players.map(function (p) {
         var r = resolve(p), st = r.sid ? (m.S[r.sid] || {}) : {}, g = teamGame[r.team];
-        var pts = r.sid ? dkPoints(st, r.pos) : 0;
-        var proj = r.sid && m.P[r.sid] ? dkPoints(m.P[r.sid], r.pos) : num((sal[p.dkId] || {}).avg);
+        var gs = g ? g.state : (r.team ? "bye" : undefined), mult = p.slot === "CPT" ? 1.5 : 1;
+        var pts = r.sid ? round2(mult * dkPoints(st, r.pos, gs)) : 0;
+        var proj = mult * (r.sid && m.P[r.sid] ? dkPoints(m.P[r.sid], r.pos, "proj") : num((sal[p.dkId] || {}).avg));
         var remain = g ? g.remain : 0;
         return { slot: p.slot, name: p.name, dkId: p.dkId, sid: r.sid, pos: r.pos, team: r.team, sal: (sal[p.dkId] || {}).sal || null,
           pts: pts, proj: round1(proj), live: round1(pts + proj * remain), tds: tdCount(st),
           status: g ? g.state : (r.team ? "bye" : "?"), rz: !!(g && g.rz), poss: !!(g && g.poss === r.team), matched: !!r.sid };
       });
       var sum = function (f) { return players.reduce(function (a, x) { return a + (f(x) || 0); }, 0); };
-      return { n: n + 1, entry: lu.entry, contest: lu.contest, contestId: lu.contestId, fee: lu.fee, players: players,
+      var missing = (lu.missing || []).slice();
+      if (!lu.showdown && players.length + missing.length < CLASSIC.length) {   // e.g. older saved imports: list the absent Classic slots
+        var left = CLASSIC.slice();
+        players.concat(missing).forEach(function (x) { var j = left.indexOf(x.slot); if (j >= 0) left.splice(j, 1); else left.pop(); });
+        left.forEach(function (sl) { missing.push({ slot: sl, cell: "" }); });
+      }
+      return { n: n + 1, entry: lu.entry, contest: lu.contest, contestId: lu.contestId, fee: lu.fee, players: players, missing: missing,
+        showdown: !!lu.showdown,
         pts: round2(sum(function (x) { return x.pts; })), proj: round1(sum(function (x) { return x.proj; })),
         live: round1(sum(function (x) { return x.live; })), sal: sum(function (x) { return x.sal; }),
         yet: players.filter(function (x) { return x.status === "pre"; }).length,
@@ -388,8 +454,11 @@
       var c = contests[k] || (contests[k] = { name: lu.contest || "Imported lineups", id: lu.contestId, entries: 0, fees: 0 });
       c.entries++; c.fees += lu.fee || 0;
     });
+    var incomplete = lineups.filter(function (lu) { return lu.missing.length; }).map(function (lu) {
+      return { n: lu.n, entry: lu.entry, slots: lu.missing.map(function (x) { return x.slot; }), cells: lu.missing.map(function (x) { return x.cell; }) };
+    });
     return { lineups: lineups, exposure: exposure, contests: Object.keys(contests).map(function (k) { return contests[k]; }),
-      unmatched: exposure.filter(function (e) { return !e.matched; }).map(function (e) { return e.name; }) };
+      unmatched: exposure.filter(function (e) { return !e.matched; }).map(function (e) { return e.name; }), incomplete: incomplete };
   }
 
   function buildInterest(sleeper, dk, m, teamGame, games) {
@@ -405,7 +474,8 @@
     dk.lineups.forEach(function (lu) { lu.players.forEach(function (p) { if (p.sid) add(p.sid, p).dk++; }); });
     Object.keys(it).forEach(function (pid) {
       var st = m.S[pid] || {}, x = it[pid];
-      x.pts = round2(num(st.pts_ppr)); x.tds = tdCount(st); x.dkpts = dkPoints(st, /^[A-Z]+$/.test(pid) ? "DEF" : "");
+      var tg = teamGame[x.team];
+      x.pts = round2(num(st.pts_ppr)); x.tds = tdCount(st); x.dkpts = dkPoints(st, /^[A-Z]+$/.test(pid) ? "DEF" : "", tg ? tg.state : "bye");
     });
     games.forEach(function (g) { g.mine = 0; g.against = 0; g.dk = 0; g.names = []; });
     Object.keys(it).forEach(function (pid) {
@@ -425,7 +495,7 @@
       .concat(raw.espn ? buildESPN(raw.espn, m, sb.teamGame) : []);
     var dk = buildDK(raw.dk, m, sb.teamGame);
     var interest = buildInterest(sleeper, dk, m, sb.teamGame, sb.games);
-    return { week: raw.week, season: raw.season, scoreSource: raw.scoreboard ? "espn" : "sleeper-schedule", games: sb.games, sleeper: sleeper, dk: dk, interest: interest };
+    return { week: raw.week, season: raw.season, seasonType: raw.seasonType || "regular", scoreSource: raw.scoreboard ? "espn" : "sleeper-schedule", games: sb.games, sleeper: sleeper, dk: dk, interest: interest };
   }
 
   /* diff two interest maps -> scoring events */
@@ -445,7 +515,79 @@
     return ev;
   }
 
+  /* ------------------------------------------------------------ UI helpers (pure, tested in Node) */
+  /* Display name: last name for players, nickname for team defenses ("New York Giants" -> "Giants"). */
+  function lastName(n) {
+    n = String(n == null ? "" : n).trim();
+    var p = n.split(/\s+/), w = norm(n).split(" ");
+    if (p.length > 1 && w.length <= 4 && NICK[w[w.length - 1]]) return p[p.length - 1];
+    if (NICK[norm(n)]) return n;
+    return p.length > 1 ? p.slice(1).join(" ") : n;
+  }
+  /* Red-zone radar rows. Every name is escaped; only our own markup is added. */
+  function radarHTML(games, interest) {
+    var rz = (games || []).filter(function (g) { return g.rz; });
+    var rows = rz.map(function (g) {
+      var mine = [], opp = [];
+      Object.keys(interest || {}).forEach(function (pid) {
+        var x = interest[pid];
+        if (x.team !== g.poss) return;
+        if (x.mine.length || x.dk) mine.push(esc(lastName(x.name)) + (x.dk ? '<sup class="tag dk">DK' + (+x.dk || 0) + "</sup>" : ""));
+        if (x.opp.length) opp.push(esc(lastName(x.name)));
+      });
+      return '<div class="row" data-game="' + esc(g.id) + '"><div class="g">' + esc(g.poss) + ' <span style="color:var(--dim)">' + esc(g.dd) + "</span></div>" +
+        '<div class="who">' + (mine.length ? '<span style="color:var(--good)">\u25b2 ' + mine.join(", ") + "</span> " : "") +
+        (opp.length ? '<span style="color:var(--bad)">\u25bc ' + opp.join(", ") + "</span>" : "") +
+        (!mine.length && !opp.length ? '<span style="color:var(--dim)">none of your guys on offense</span>' : "") + "</div></div>";
+    });
+    return { count: rz.length, html: rows.join("") };
+  }
+
+  /* ------------------------------------------------------------ data freshness + polling */
+  /* health = {source: {ok: last success ms, fails: consecutive failures, err: last error, critical: bool}}
+   * -> {level: "connecting" | "ok" | "stale" | "offline", age: seconds since the OLDEST critical source last
+   *     succeeded (null if never), failing: [source names whose last attempt failed]} */
+  function dataStatus(health, now, intervalSec) {
+    var crit = Object.keys(health || {}).filter(function (k) { return health[k].critical; });
+    var failing = Object.keys(health || {}).filter(function (k) { return health[k].fails > 0; });
+    var oks = crit.map(function (k) { return health[k].ok || 0; }).filter(Boolean);   // never-loaded sources show as failing
+    var oldest = oks.length ? Math.min.apply(null, oks) : 0;
+    var age = oldest ? Math.max(0, Math.round((now - oldest) / 1000)) : null;
+    var iv = Math.max(10, intervalSec || 15);
+    var critFailing = crit.filter(function (k) { return health[k].fails > 0; });
+    var level;
+    if (age == null) level = critFailing.length ? "offline" : "connecting";
+    else if ((crit.length && critFailing.length === crit.length) || age > Math.max(180, 6 * iv)) level = "offline";
+    else if (failing.length || age > 2.5 * iv + 15) level = "stale";
+    else level = "ok";
+    return { level: level, age: age, failing: failing };
+  }
+  /* Next refresh delay in ms: the user's rate while a game is live or about to start, every minute when a
+   * game starts within 3 hours, every 5 minutes otherwise. After failed refreshes it backs off: doubled per
+   * consecutive failure, up to 8x (2 min at the default 15 s), never more than 5 minutes. */
+  function pollDelay(games, now, baseSec, fails) {
+    var base = Math.max(10, baseSec || 15), d = 300;
+    (games || []).forEach(function (g) {
+      if (g.state === "in") { d = Math.min(d, base); return; }
+      if (g.state !== "pre") return;
+      var t = Date.parse(g.kick), mins = isFinite(t) ? (t - now) / 60000 : Infinity;
+      if (mins <= 20) d = Math.min(d, base);            // about to start, or past kickoff but not flagged live yet
+      else if (mins <= 180) d = Math.min(d, 60);
+    });
+    if (fails > 0) d = Math.min(300, Math.max(d, base) * Math.pow(2, Math.min(fails, 3)));
+    return Math.round(d * 1000);
+  }
+  /* Week-scoped storage: values saved with {season, week, seasonType}; anything from another week is discarded. */
+  function scoped(stored, season, week, seasonType) {
+    if (!stored || typeof stored !== "object" || Array.isArray(stored)) return null;
+    if (String(stored.season) !== String(season) || String(stored.week) !== String(week) ||
+        String(stored.seasonType || "regular") !== String(seasonType || "regular")) return null;
+    return stored.data == null ? null : stored.data;
+  }
+
   return { ESPN_HOST: ESPN_HOST, espnPath: espnPath, espnTeams: espnTeams, buildESPN: buildESPN, urls: urls, norm: norm, dkPoints: dkPoints, tdCount: tdCount, parseCSV: parseCSV, parseDK: parseDK,
     parseScoreboard: parseScoreboard, scheduleToScoreboard: scheduleToScoreboard, statMaps: statMaps, buildSleeper: buildSleeper, buildDK: buildDK,
-    buildState: buildState, diffEvents: diffEvents, winProb: winProb, leaguePtsKey: leaguePtsKey, NICK: NICK };
+    buildState: buildState, diffEvents: diffEvents, winProb: winProb, leaguePtsKey: leaguePtsKey, NICK: NICK,
+    esc: esc, safeUrl: safeUrl, parseCell: parseCell, lastName: lastName, radarHTML: radarHTML, dataStatus: dataStatus,
+    pollDelay: pollDelay, scoped: scoped, buildInterest: buildInterest };
 });
