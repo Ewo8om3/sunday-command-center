@@ -1,0 +1,9 @@
+# personal data never belongs in this repo
+*.csv
+!test/fixtures/*.csv
+proxy/config.json
+proxy/*.local.json
+cache/
+node_modules/
+.DS_Store
+Thumbs.db
