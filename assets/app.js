@@ -577,6 +577,15 @@
   });
   addEventListener("resize", render);
   window.SCC_DISPLAYS = DISPLAYS;
+  /* keep the screen awake while the dashboard is visible (Screen Wake Lock API, where supported) */
+  var wake = null;
+  function keepAwake() {
+    if (settings.noWake || !navigator.wakeLock || document.visibilityState !== "visible" || wake) return;
+    navigator.wakeLock.request("screen").then(function (w) { wake = w; w.addEventListener("release", function () { wake = null; }); }).catch(function () { });
+  }
+  document.addEventListener("visibilitychange", keepAwake);
+  document.addEventListener("click", keepAwake);
+  keepAwake();
 
   var help = document.createElement("div");
   help.className = "help";

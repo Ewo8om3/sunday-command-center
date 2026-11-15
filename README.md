@@ -8,6 +8,12 @@ your fantasy matchups, every game's score and red-zone status, and your DraftKin
 It's a static web page: no install, no account, no server, no build step. Open it on GitHub Pages or
 double-click `index.html` from the zip.
 
+### 👉 [Open the dashboard](https://ewo8om3.github.io/sunday-command-center/) · [Try the demo](https://ewo8om3.github.io/sunday-command-center/?demo=1) · **[Full setup guide (SETUP.md)](SETUP.md)**
+
+The setup guide covers every screen setup (4K, 1440p, 1080p, ultrawide, dual/triple monitors, laptop + TV,
+tablet/phone), window snapping on Windows, Mac and Linux, every RedZone source, connecting leagues, DK imports
+and troubleshooting.
+
 ## Features
 
 - **RedZone radar**: which offense is inside the 20 right now, and which of *your* players (▲) or your
@@ -33,8 +39,8 @@ Try it with fake leagues on live NFL stats: add `?demo=1` to the URL.
 
 ## Use it
 
-**Hosted:** `https://<your-github-user>.github.io/sunday-command-center/`
-(fork this repo → Settings → Pages → Deploy from branch `main` / root).
+**Hosted:** <https://ewo8om3.github.io/sunday-command-center/>. To host your own copy, fork this repo →
+Settings → Pages → Deploy from branch `main` / root.
 
 **Local / zip:** download the repo zip, unzip, double-click `index.html` (Chrome, Edge, Firefox or Safari).
 If your browser is picky about `file://` pages, run `python3 -m http.server` in the folder and open
@@ -67,10 +73,10 @@ for private leagues the page:
 
 **Run the proxy:** install Python 3 and double-click `proxy/start-proxy.bat` (Windows), or run
 `proxy/start-proxy.sh` (Mac/Linux). Leave the window open. It listens on <http://localhost:8766>
-(Settings → ESPN → *Test proxy*). If Chrome asks whether the page may access devices on your local network,
+(Settings → ESPN → *Test proxy*). [SETUP.md §1.D](SETUP.md#d-optional-espn-private-league-proxy) explains how to check Python is installed. If Chrome asks whether the page may access devices on your local network,
 click Allow.
 
-**Get `espn_s2` and `SWID`:**
+**Get `espn_s2` and `SWID`** (browser-by-browser steps in [SETUP.md §7](SETUP.md#7-connecting-leagues)):
 1. Sign in at <https://fantasy.espn.com> in Chrome/Edge/Firefox and open your league.
 2. Open DevTools (`F12`, or `Cmd`+`Opt`+`I` on Mac) → **Application** tab (Firefox: **Storage**) → **Cookies** →
    `https://fantasy.espn.com`.
@@ -84,8 +90,8 @@ share them. They expire after a while, so re-copy them if private leagues stop l
 
 ## Put it next to RedZone
 
-See **[SETUP.md](SETUP.md)** for FancyZones (Windows) and Mac layouts, with exact zone sizes for 4K, 1440p and
-1080p. The 4K default looks like this:
+See **[SETUP.md](SETUP.md)** for step-by-step layouts on any setup, with exact zone sizes, FancyZones / Snap /
+Rectangle / macOS tiling steps, and how to get each RedZone source into its own window. The 4K default looks like this:
 
 ![4K layout](docs/layout-4k.png)
 
